@@ -12,6 +12,8 @@
 #include <CfxLocale.h>
 #include <winternl.h>
 #include <MinHook.h>
+#include <EarlyStartupTrace.h>
+#include <EarlyStartupRawTrace.h>
 #endif
 
 #pragma comment(lib, "d3d11.lib")
@@ -176,9 +178,52 @@ static NTSTATUS NTAPI EarlyLdrLoadDllStub(const wchar_t* fileName, uint32_t* fla
 
 void EarlyLdrBlock_Init()
 {
-	MH_Initialize();
-	MH_CreateHookApi(L"ntdll.dll", "LdrLoadDll", EarlyLdrLoadDllStub, (void**)&g_earlyOrigLoadDll);
-	MH_EnableHook(MH_ALL_HOOKS);
+	MH_STATUS status;
+	DWORD mhLastError;
+	DWORD rawTraceOpenError;
+
+	CfxEarlyTextTrace("EarlyLdrBlock_Init.begin");
+
+	CfxEarlyTextTrace("MH_Initialize.begin");
+	status = MH_Initialize();
+	mhLastError = GetLastError();
+	CfxEarlyTextTrace(
+		"MH_Initialize.end status=%d lastError=%lu",
+		(int)status,
+		(unsigned long)mhLastError);
+	SetLastError(mhLastError);
+
+	CfxEarlyTextTrace("MH_CreateHookApi.begin");
+	status = MH_CreateHookApi(
+		L"ntdll.dll",
+		"LdrLoadDll",
+		EarlyLdrLoadDllStub,
+		(void**)&g_earlyOrigLoadDll);
+	mhLastError = GetLastError();
+	CfxEarlyTextTrace(
+		"MH_CreateHookApi.end status=%d lastError=%lu",
+		(int)status,
+		(unsigned long)mhLastError);
+	SetLastError(mhLastError);
+
+	rawTraceOpenError = CfxEarlyRawTraceOpen();
+	CfxEarlyTextTrace(
+		"MH_EnableHook.begin rawTraceOpenError=%lu",
+		(unsigned long)rawTraceOpenError);
+
+	status = MH_EnableHook(MH_ALL_HOOKS);
+	mhLastError = GetLastError();
+
+	CfxEarlyRawTraceClose();
+	SetLastError(mhLastError);
+
+	CfxEarlyTextTrace(
+		"MH_EnableHook.end status=%d lastError=%lu",
+		(int)status,
+		(unsigned long)mhLastError);
+	SetLastError(mhLastError);
+
+	CfxEarlyTextTrace("EarlyLdrBlock_Init.end");
 }
 #endif
 

@@ -19,6 +19,7 @@
 #include <UUIState.h>
 #include "TickCountData.h"
 #include <HostSharedData.h>
+#include <EarlyStartupTrace.h>
 
 #include <array>
 #include <optional>
@@ -128,6 +129,8 @@ void DLLError(DWORD errorCode, std::string_view dllName)
 
 int RealMain()
 {
+	CfxEarlyTextTrace("RealMain.enter");
+
 #ifdef LAUNCHER_PERSONALITY_MAIN
 	// block problematic DLLs as early as possible, before any D3D/UI initialization
 	EarlyLdrBlock_Init();

@@ -1,0 +1,141 @@
+name: FiveM early-startup trace Debug
+
+on:
+  push:
+    branches:
+      - diagnostics/early-trace
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      SOURCE_ROOT: 'C:\b\five'
+      WINDOWS_SDK_VERSION: '10.0.22621.0'
+
+    steps:
+      - name: Checkout repository and submodules at short path
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+          New-Item -ItemType Directory -Force C:\b | Out-Null
+          git init $env:SOURCE_ROOT
+          git -C $env:SOURCE_ROOT config core.symlinks true
+          git -C $env:SOURCE_ROOT remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git"
+          git -C $env:SOURCE_ROOT fetch --no-tags --depth=1 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository fetch failed."
+          }
+
+          git -C $env:SOURCE_ROOT checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository checkout failed."
+          }
+
+          git -C $env:SOURCE_ROOT submodule update --init --recursive --depth=1 --jobs=4
+          if ($LASTEXITCODE -ne 0) {
+            throw "Submodule checkout failed."
+          }
+
+      - name: Apply pinned MinHook instrumentation patch
+        shell: pwsh
+        run: |
+          $minHook = Join-Path $env:SOURCE_ROOT 'vendor\minhook'
+          $patch = Join-Path $env:SOURCE_ROOT '.github\patches\minhook-early-startup.patch'
+          $expectedCommit = 'b03840395033006c888288ac00a4608d8e2684cf'
+          $actualCommit = (git -C $minHook rev-parse HEAD).Trim()
+
+          if ($actualCommit -ne $expectedCommit) {
+            throw "Unexpected MinHook commit: $actualCommit"
+          }
+
+          git -C $minHook apply --check --whitespace=error-all $patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "MinHook patch check failed."
+          }
+
+          git -C $minHook apply --whitespace=error-all $patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "MinHook patch application failed."
+          }
+
+          git -C $minHook diff --check -- src/hook.c
+          if ($LASTEXITCODE -ne 0) {
+            throw "Patched hook.c failed git diff --check."
+          }
+
+      - name: Generate VS2022 projects
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 gen -game five
+          if ($LASTEXITCODE -ne 0) {
+            throw "FiveM project generation failed."
+          }
+
+      - name: Build CitiLaunch Debug x64
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+
+          $vsRoot = (& $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath).Trim()
+
+          if (-not $vsRoot) {
+            throw "Visual Studio 2022 with x64 C++ tools was not found."
+          }
+
+          $msbuild = Join-Path $vsRoot 'MSBuild\Current\Bin\MSBuild.exe'
+          $project = Join-Path $env:SOURCE_ROOT 'code\build\five\CitiLaunch.vcxproj'
+
+          if (-not (Test-Path $project)) {
+            throw "Generated CitiLaunch project was not found: $project"
+          }
+
+          $env:UseMultiToolTask = 'true'
+          $env:EnforceProcessCountAcrossBuilds = 'true'
+
+          & $msbuild $project `
+            /t:Build `
+            /m:4 `
+            /nr:false `
+            /v:minimal `
+            /p:Configuration=Debug `
+            /p:Platform=x64 `
+            /p:PreferredToolArchitecture=x64 `
+            "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION" `
+            /p:BuildProjectReferences=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CitiLaunch build failed with exit code $LASTEXITCODE."
+          }
+
+          $fiveM = Join-Path $env:SOURCE_ROOT 'code\bin\five\debug\FiveM.exe'
+          $pdb = Join-Path $env:SOURCE_ROOT 'code\bin\five\debug\dbg\FiveM.pdb'
+
+          if (-not (Test-Path $fiveM)) {
+            throw "Expected FiveM.exe was not produced: $fiveM"
+          }
+
+          if (-not (Test-Path $pdb)) {
+            throw "Expected FiveM.pdb was not produced: $pdb"
+          }
+
+      - name: Upload FiveM Debug artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: FiveM-debug-early-startup-trace
+          path: |
+            C:\b\five\code\bin\five\debug\FiveM.exe
+            C:\b\five\code\bin\five\debug\dbg\FiveM.pdb
+          if-no-files-found: error

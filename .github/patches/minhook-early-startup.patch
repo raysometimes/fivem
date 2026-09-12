@@ -1,0 +1,395 @@
+diff --git a/src/hook.c b/src/hook.c
+index aee7bb3..8d10dc9 100644
+--- a/src/hook.c
++++ b/src/hook.c
+@@ -33,11 +33,116 @@
+ #include "../include/MinHook.h"
+ #include "buffer.h"
+ #include "trampoline.h"
++#include "../../../code/client/shared/EarlyStartupRawTrace.h"
+ 
+ #ifndef ARRAYSIZE
+     #define ARRAYSIZE(A) (sizeof(A)/sizeof((A)[0]))
+ #endif
+ 
++static HANDLE g_cfxEarlyRawTraceFile = INVALID_HANDLE_VALUE;
++
++DWORD CfxEarlyRawTraceOpen(void)
++{
++    DWORD savedLastError = GetLastError();
++    DWORD result = ERROR_SUCCESS;
++    static const WCHAR suffix[] = L".minhook-freeze.bin";
++    WCHAR tracePath[MAX_PATH + 32];
++    DWORD pathLength;
++    DWORD suffixLength;
++    DWORD i;
++
++    if (g_cfxEarlyRawTraceFile != INVALID_HANDLE_VALUE)
++        goto exit;
++
++    pathLength = GetModuleFileNameW(
++        NULL,
++        tracePath,
++        (DWORD)ARRAYSIZE(tracePath));
++
++    if (pathLength == 0)
++    {
++        result = GetLastError();
++        if (result == ERROR_SUCCESS)
++            result = ERROR_GEN_FAILURE;
++        goto exit;
++    }
++
++    suffixLength = (DWORD)ARRAYSIZE(suffix);
++    if (pathLength + suffixLength > (DWORD)ARRAYSIZE(tracePath))
++    {
++        result = ERROR_BUFFER_OVERFLOW;
++        goto exit;
++    }
++
++    /*
++     * Manual copy: do not introduce memcpy or any other CRT operation into
++     * the raw tracer implementation.
++     */
++    for (i = 0; i < suffixLength; ++i)
++        tracePath[pathLength + i] = suffix[i];
++
++    g_cfxEarlyRawTraceFile = CreateFileW(
++        tracePath,
++        GENERIC_WRITE,
++        FILE_SHARE_READ,
++        NULL,
++        CREATE_ALWAYS,
++        FILE_ATTRIBUTE_NORMAL,
++        NULL);
++
++    if (g_cfxEarlyRawTraceFile == INVALID_HANDLE_VALUE)
++        result = GetLastError();
++
++exit:
++    SetLastError(savedLastError);
++    return result;
++}
++
++VOID CfxEarlyRawTraceClose(void)
++{
++    DWORD savedLastError = GetLastError();
++
++    if (g_cfxEarlyRawTraceFile != INVALID_HANDLE_VALUE)
++    {
++        HANDLE file = g_cfxEarlyRawTraceFile;
++        g_cfxEarlyRawTraceFile = INVALID_HANDLE_VALUE;
++        CloseHandle(file);
++    }
++
++    SetLastError(savedLastError);
++}
++
++VOID CfxEarlyRawTraceWrite(
++    uint32_t marker,
++    uint64_t value1,
++    uint64_t value2,
++    uint32_t lastError)
++{
++    DWORD savedLastError = GetLastError();
++
++    if (g_cfxEarlyRawTraceFile != INVALID_HANDLE_VALUE)
++    {
++        CfxEarlyRawTraceRecord record;
++        DWORD written;
++
++        record.marker = marker;
++        record.processId = GetCurrentProcessId();
++        record.threadId = GetCurrentThreadId();
++        record.value1 = value1;
++        record.value2 = value2;
++        record.lastError = lastError;
++
++        WriteFile(
++            g_cfxEarlyRawTraceFile,
++            &record,
++            (DWORD)sizeof(record),
++            &written,
++            NULL);
++    }
++
++    SetLastError(savedLastError);
++}
++
+ // Initial capacity of the HOOK_ENTRY buffer.
+ #define INITIAL_HOOK_CAPACITY   32
+ 
+@@ -208,9 +313,28 @@ static VOID ProcessThreadIPs(HANDLE hThread, UINT pos, UINT action)
+     DWORD   *pIP = &c.Eip;
+ #endif
+     UINT count;
++    BOOL contextResult;
++    DWORD contextError;
+ 
+     c.ContextFlags = CONTEXT_CONTROL;
+-    if (!GetThreadContext(hThread, &c))
++
++    CfxEarlyRawTraceWrite(
++        CfxRawTrace_GetThreadContextBegin,
++        (uint64_t)(ULONG_PTR)hThread,
++        (uint64_t)CONTEXT_CONTROL,
++        GetLastError());
++
++    contextResult = GetThreadContext(hThread, &c);
++    contextError = GetLastError();
++
++    CfxEarlyRawTraceWrite(
++        CfxRawTrace_GetThreadContextEnd,
++        (uint64_t)(ULONG_PTR)hThread,
++        (uint64_t)contextResult,
++        contextError);
++    SetLastError(contextError);
++
++    if (!contextResult)
+         return;
+ 
+     if (pos == ALL_HOOKS_POS)
+@@ -253,8 +377,26 @@ static VOID ProcessThreadIPs(HANDLE hThread, UINT pos, UINT action)
+ 
+         if (ip != 0)
+         {
++            BOOL setResult;
++            DWORD setError;
++
+             *pIP = ip;
+-            SetThreadContext(hThread, &c);
++
++            CfxEarlyRawTraceWrite(
++                CfxRawTrace_SetThreadContextBegin,
++                (uint64_t)(ULONG_PTR)hThread,
++                (uint64_t)CONTEXT_CONTROL,
++                GetLastError());
++
++            setResult = SetThreadContext(hThread, &c);
++            setError = GetLastError();
++
++            CfxEarlyRawTraceWrite(
++                CfxRawTrace_SetThreadContextEnd,
++                (uint64_t)(ULONG_PTR)hThread,
++                (uint64_t)setResult,
++                setError);
++            SetLastError(setError);
+         }
+     }
+ }
+@@ -262,19 +404,66 @@ static VOID ProcessThreadIPs(HANDLE hThread, UINT pos, UINT action)
+ //-------------------------------------------------------------------------
+ static VOID EnumerateThreads(PFROZEN_THREADS pThreads)
+ {
+-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++    HANDLE hSnapshot;
++    DWORD snapshotError;
++
++    CfxEarlyRawTraceWrite(
++        CfxRawTrace_SnapshotBegin,
++        (uint64_t)TH32CS_SNAPTHREAD,
++        0,
++        GetLastError());
++
++    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++    snapshotError = GetLastError();
++
++    CfxEarlyRawTraceWrite(
++        CfxRawTrace_SnapshotEnd,
++        (uint64_t)(ULONG_PTR)hSnapshot,
++        (uint64_t)(hSnapshot != INVALID_HANDLE_VALUE),
++        snapshotError);
++    SetLastError(snapshotError);
++
+     if (hSnapshot != INVALID_HANDLE_VALUE)
+     {
+         THREADENTRY32 te;
++        BOOL firstResult;
++        DWORD firstError;
++
+         te.dwSize = sizeof(THREADENTRY32);
+-        if (Thread32First(hSnapshot, &te))
++
++        CfxEarlyRawTraceWrite(
++            CfxRawTrace_Thread32FirstBegin,
++            (uint64_t)(ULONG_PTR)hSnapshot,
++            (uint64_t)sizeof(THREADENTRY32),
++            GetLastError());
++
++        firstResult = Thread32First(hSnapshot, &te);
++        firstError = GetLastError();
++
++        CfxEarlyRawTraceWrite(
++            CfxRawTrace_Thread32FirstEnd,
++            (uint64_t)firstResult,
++            firstResult ? (uint64_t)te.th32ThreadID : 0,
++            firstError);
++        SetLastError(firstError);
++
++        if (firstResult)
+         {
++            BOOL nextResult;
++            DWORD nextError;
++
+             do
+             {
+                 if (te.dwSize >= (FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(DWORD))
+                     && te.th32OwnerProcessID == GetCurrentProcessId()
+                     && te.th32ThreadID != GetCurrentThreadId())
+                 {
++                    CfxEarlyRawTraceWrite(
++                        CfxRawTrace_CandidateThread,
++                        (uint64_t)te.th32ThreadID,
++                        (uint64_t)te.th32OwnerProcessID,
++                        GetLastError());
++
+                     if (pThreads->pItems == NULL)
+                     {
+                         pThreads->capacity = INITIAL_THREAD_CAPACITY;
+@@ -297,7 +486,23 @@ static VOID EnumerateThreads(PFROZEN_THREADS pThreads)
+                 }
+ 
+                 te.dwSize = sizeof(THREADENTRY32);
+-            } while (Thread32Next(hSnapshot, &te));
++
++                CfxEarlyRawTraceWrite(
++                    CfxRawTrace_Thread32NextBegin,
++                    (uint64_t)(ULONG_PTR)hSnapshot,
++                    (uint64_t)te.th32ThreadID,
++                    GetLastError());
++
++                nextResult = Thread32Next(hSnapshot, &te);
++                nextError = GetLastError();
++
++                CfxEarlyRawTraceWrite(
++                    CfxRawTrace_Thread32NextEnd,
++                    (uint64_t)nextResult,
++                    nextResult ? (uint64_t)te.th32ThreadID : 0,
++                    nextError);
++                SetLastError(nextError);
++            } while (nextResult);
+         }
+         CloseHandle(hSnapshot);
+     }
+@@ -306,6 +511,12 @@ static VOID EnumerateThreads(PFROZEN_THREADS pThreads)
+ //-------------------------------------------------------------------------
+ static VOID Freeze(PFROZEN_THREADS pThreads, UINT pos, UINT action)
+ {
++    CfxEarlyRawTraceWrite(
++        CfxRawTrace_FreezeEnter,
++        (uint64_t)pos,
++        (uint64_t)action,
++        GetLastError());
++
+     pThreads->pItems   = NULL;
+     pThreads->capacity = 0;
+     pThreads->size     = 0;
+@@ -316,15 +527,57 @@ static VOID Freeze(PFROZEN_THREADS pThreads, UINT pos, UINT action)
+         UINT i;
+         for (i = 0; i < pThreads->size; ++i)
+         {
+-            HANDLE hThread = OpenThread(THREAD_ACCESS, FALSE, pThreads->pItems[i]);
++            DWORD threadId = pThreads->pItems[i];
++            HANDLE hThread;
++            DWORD openError;
++            DWORD suspendResult;
++            DWORD suspendError;
++
++            CfxEarlyRawTraceWrite(
++                CfxRawTrace_OpenThreadBegin,
++                (uint64_t)threadId,
++                (uint64_t)THREAD_ACCESS,
++                GetLastError());
++
++            hThread = OpenThread(THREAD_ACCESS, FALSE, threadId);
++            openError = GetLastError();
++
++            CfxEarlyRawTraceWrite(
++                CfxRawTrace_OpenThreadEnd,
++                (uint64_t)threadId,
++                (uint64_t)(ULONG_PTR)hThread,
++                openError);
++            SetLastError(openError);
++
+             if (hThread != NULL)
+             {
+-                SuspendThread(hThread);
++                CfxEarlyRawTraceWrite(
++                    CfxRawTrace_SuspendThreadBegin,
++                    (uint64_t)threadId,
++                    (uint64_t)(ULONG_PTR)hThread,
++                    GetLastError());
++
++                suspendResult = SuspendThread(hThread);
++                suspendError = GetLastError();
++
++                CfxEarlyRawTraceWrite(
++                    CfxRawTrace_SuspendThreadEnd,
++                    (uint64_t)threadId,
++                    (uint64_t)suspendResult,
++                    suspendError);
++                SetLastError(suspendError);
++
+                 ProcessThreadIPs(hThread, pos, action);
+                 CloseHandle(hThread);
+             }
+         }
+     }
++
++    CfxEarlyRawTraceWrite(
++        CfxRawTrace_FreezeExit,
++        (uint64_t)pThreads->size,
++        (uint64_t)action,
++        GetLastError());
+ }
+ 
+ //-------------------------------------------------------------------------
+@@ -335,10 +588,46 @@ static VOID Unfreeze(PFROZEN_THREADS pThreads)
+         UINT i;
+         for (i = 0; i < pThreads->size; ++i)
+         {
+-            HANDLE hThread = OpenThread(THREAD_ACCESS, FALSE, pThreads->pItems[i]);
++            DWORD threadId = pThreads->pItems[i];
++            HANDLE hThread;
++            DWORD openError;
++            DWORD resumeResult;
++            DWORD resumeError;
++
++            CfxEarlyRawTraceWrite(
++                CfxRawTrace_UnfreezeOpenThreadBegin,
++                (uint64_t)threadId,
++                (uint64_t)THREAD_ACCESS,
++                GetLastError());
++
++            hThread = OpenThread(THREAD_ACCESS, FALSE, threadId);
++            openError = GetLastError();
++
++            CfxEarlyRawTraceWrite(
++                CfxRawTrace_UnfreezeOpenThreadEnd,
++                (uint64_t)threadId,
++                (uint64_t)(ULONG_PTR)hThread,
++                openError);
++            SetLastError(openError);
++
+             if (hThread != NULL)
+             {
+-                ResumeThread(hThread);
++                CfxEarlyRawTraceWrite(
++                    CfxRawTrace_ResumeThreadBegin,
++                    (uint64_t)threadId,
++                    (uint64_t)(ULONG_PTR)hThread,
++                    GetLastError());
++
++                resumeResult = ResumeThread(hThread);
++                resumeError = GetLastError();
++
++                CfxEarlyRawTraceWrite(
++                    CfxRawTrace_ResumeThreadEnd,
++                    (uint64_t)threadId,
++                    (uint64_t)resumeResult,
++                    resumeError);
++                SetLastError(resumeError);
++
+                 CloseHandle(hThread);
+             }
+         }
