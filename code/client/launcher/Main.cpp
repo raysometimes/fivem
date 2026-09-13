@@ -55,6 +55,7 @@ void NVSP_DisableOnStartup();
 void XBR_EarlySelect();
 bool ExecutablePreload_Init();
 void InitLogging();
+void StartLoggingThread();
 
 #include <MinMode.h>
 #include <fstream>
@@ -134,7 +135,11 @@ int RealMain()
 #ifdef LAUNCHER_PERSONALITY_MAIN
 	// block problematic DLLs as early as possible, before any D3D/UI initialization
 	EarlyLdrBlock_Init();
+#endif
 
+	StartLoggingThread();
+
+#ifdef LAUNCHER_PERSONALITY_MAIN
 	if (!EnsureCompatibleOSVersion())
 	{
 		return 100;
