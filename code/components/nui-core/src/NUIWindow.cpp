@@ -669,6 +669,116 @@ void NUIWindow::UpdateFrame()
 
 		SetLastError(previousLastError);
 
+		static HWND loggedDisplayHwnd = nullptr;
+		if (hwnd && hwnd != loggedDisplayHwnd)
+		{
+			const DWORD previousDisplayLastError = GetLastError();
+			const int systemWidth = GetSystemMetrics(SM_CXSCREEN);
+			const int systemHeight = GetSystemMetrics(SM_CYSCREEN);
+
+			SetLastError(ERROR_SUCCESS);
+			const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+			const DWORD monitorError = monitor ? ERROR_SUCCESS : GetLastError();
+
+			MONITORINFOEXW monitorInfo = {};
+			monitorInfo.cbSize = sizeof(monitorInfo);
+			SetLastError(ERROR_SUCCESS);
+			const BOOL monitorInfoValid = GetMonitorInfoW(monitor, &monitorInfo);
+			const DWORD monitorInfoError = monitorInfoValid ? ERROR_SUCCESS : GetLastError();
+			const wchar_t* displayDevice = monitorInfoValid ? monitorInfo.szDevice : nullptr;
+			const std::string displayDeviceName = monitorInfoValid ? ToNarrow(monitorInfo.szDevice) : "<unavailable>";
+
+			DEVMODEW currentMode = {};
+			currentMode.dmSize = sizeof(currentMode);
+			SetLastError(ERROR_SUCCESS);
+			const BOOL currentModeValid = EnumDisplaySettingsW(displayDevice, ENUM_CURRENT_SETTINGS, &currentMode);
+			const DWORD currentModeError = currentModeValid ? ERROR_SUCCESS : GetLastError();
+
+			DEVMODEW registryMode = {};
+			registryMode.dmSize = sizeof(registryMode);
+			SetLastError(ERROR_SUCCESS);
+			const BOOL registryModeValid = EnumDisplaySettingsW(displayDevice, ENUM_REGISTRY_SETTINGS, &registryMode);
+			const DWORD registryModeError = registryModeValid ? ERROR_SUCCESS : GetLastError();
+
+			DWORD modeCount = 0;
+			DWORD maximumModeWidth = 0;
+			DWORD maximumModeHeight = 0;
+			bool has1280x800 = false;
+			bool has800x1280 = false;
+			bool has800x800 = false;
+			DWORD modeEnumerationError = ERROR_SUCCESS;
+			for (DWORD modeIndex = 0; ; ++modeIndex)
+			{
+				DEVMODEW mode = {};
+				mode.dmSize = sizeof(mode);
+				SetLastError(ERROR_SUCCESS);
+				if (!EnumDisplaySettingsW(displayDevice, modeIndex, &mode))
+				{
+					if (modeCount == 0)
+					{
+						modeEnumerationError = GetLastError();
+					}
+					break;
+				}
+
+				++modeCount;
+				maximumModeWidth = std::max(maximumModeWidth, mode.dmPelsWidth);
+				maximumModeHeight = std::max(maximumModeHeight, mode.dmPelsHeight);
+				has1280x800 = has1280x800 || (mode.dmPelsWidth == 1280 && mode.dmPelsHeight == 800);
+				has800x1280 = has800x1280 || (mode.dmPelsWidth == 800 && mode.dmPelsHeight == 1280);
+				has800x800 = has800x800 || (mode.dmPelsWidth == 800 && mode.dmPelsHeight == 800);
+			}
+
+			trace("[WineDisplay] system=%dx%d MonitorFromWindowOk=%d MonitorFromWindowError=%lu monitor=%ldx%ld monitorRect=(%ld,%ld,%ld,%ld) work=%ldx%ld workRect=(%ld,%ld,%ld,%ld) GetMonitorInfoWOk=%d GetMonitorInfoWError=%lu device=%s current=%lux%lu currentHz=%lu currentOrientation=%lu currentBpp=%lu currentFlags=%lu EnumCurrentOk=%d EnumCurrentError=%lu registry=%lux%lu registryHz=%lu registryOrientation=%lu registryBpp=%lu registryFlags=%lu EnumRegistryOk=%d EnumRegistryError=%lu modes=%lu modesOk=%d modesError=%lu has1280x800=%d has800x1280=%d has800x800=%d max=%lux%lu hwnd=%p\n",
+				systemWidth,
+				systemHeight,
+				monitor != nullptr,
+				monitorError,
+				monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
+				monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
+				monitorInfo.rcMonitor.left,
+				monitorInfo.rcMonitor.top,
+				monitorInfo.rcMonitor.right,
+				monitorInfo.rcMonitor.bottom,
+				monitorInfo.rcWork.right - monitorInfo.rcWork.left,
+				monitorInfo.rcWork.bottom - monitorInfo.rcWork.top,
+				monitorInfo.rcWork.left,
+				monitorInfo.rcWork.top,
+				monitorInfo.rcWork.right,
+				monitorInfo.rcWork.bottom,
+				monitorInfoValid,
+				monitorInfoError,
+				displayDeviceName,
+				currentMode.dmPelsWidth,
+				currentMode.dmPelsHeight,
+				currentMode.dmDisplayFrequency,
+				currentMode.dmDisplayOrientation,
+				currentMode.dmBitsPerPel,
+				currentMode.dmDisplayFlags,
+				currentModeValid,
+				currentModeError,
+				registryMode.dmPelsWidth,
+				registryMode.dmPelsHeight,
+				registryMode.dmDisplayFrequency,
+				registryMode.dmDisplayOrientation,
+				registryMode.dmBitsPerPel,
+				registryMode.dmDisplayFlags,
+				registryModeValid,
+				registryModeError,
+				modeCount,
+				modeCount != 0,
+				modeEnumerationError,
+				has1280x800,
+				has800x1280,
+				has800x800,
+				maximumModeWidth,
+				maximumModeHeight,
+				(void*)hwnd);
+
+			loggedDisplayHwnd = hwnd;
+			SetLastError(previousDisplayLastError);
+		}
+
 		if (IsFixedSizeWindow())
 		{
 			resX = 1920;
