@@ -190,7 +190,7 @@ jobs:
       - name: Install CitiCore IDL Python dependency
         shell: pwsh
         run: |
-          py -3 -m pip install "ply>=3.6,<4.0"
+          py -3 -m pip install "ply>=3.6,<4.0" six
           if ($LASTEXITCODE -ne 0) {
             throw "PLY installation failed with exit code $LASTEXITCODE."
           }
