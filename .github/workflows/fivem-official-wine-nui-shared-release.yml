@@ -60,6 +60,15 @@ jobs:
             throw "Submodule checkout failed."
           }
 
+      - name: Download pinned CEF dependency
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 get-chrome
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned CEF dependency setup failed with exit code $LASTEXITCODE."
+          }
+
       - name: Audit experiment identity and source delta
         shell: pwsh
         working-directory: 'C:\b\five'
