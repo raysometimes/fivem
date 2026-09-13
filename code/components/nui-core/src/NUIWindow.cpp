@@ -352,7 +352,7 @@ void NUIWindow::Initialize(CefString url)
 
 	CefWindowInfo info;
 	info.SetAsWindowless(NULL);
-	info.shared_texture_enabled = (!CfxIsWine() && nuiSharedResourcesEnabled);
+	
 	info.bounds.x = 0;
 	info.bounds.y = 0;
 	info.bounds.width = m_width;
