@@ -103,7 +103,7 @@ jobs:
             foreach ($reference in $projectXml.SelectNodes("//*[local-name()='ProjectReference']")) {
               $include = $reference.Include
               if ($include -match '\$\(') {
-                throw "Unresolved project-reference path in $project: $include"
+                throw "Unresolved project-reference path in ${project}: $include"
               }
 
               $referencedProject = [System.IO.Path]::GetFullPath(
