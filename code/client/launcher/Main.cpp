@@ -50,6 +50,7 @@ std::map<std::string, std::string> g_redirectionData;
 
 void DoPreLaunchTasks();
 void EarlyLdrBlock_Init();
+void StartLoggingThread();
 void NVSP_DisableOnStartup();
 void XBR_EarlySelect();
 bool ExecutablePreload_Init();
@@ -131,7 +132,11 @@ int RealMain()
 #ifdef LAUNCHER_PERSONALITY_MAIN
 	// block problematic DLLs as early as possible, before any D3D/UI initialization
 	EarlyLdrBlock_Init();
+#endif
 
+	StartLoggingThread();
+
+#ifdef LAUNCHER_PERSONALITY_MAIN
 	if (!EnsureCompatibleOSVersion())
 	{
 		return 100;

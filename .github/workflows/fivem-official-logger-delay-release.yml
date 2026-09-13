@@ -1,0 +1,186 @@
+name: FiveM official logger-delay Release
+
+on:
+  push:
+    branches:
+      - diagnostics/official-logger-delay
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      SOURCE_ROOT: 'C:\b\five'
+      WINDOWS_SDK_VERSION: '10.0.22621.0'
+      PINNED_UPSTREAM_COMMIT: '0d8a2a6f78a9922445d8930305af82a7b1826980'
+
+    steps:
+      - name: Checkout repository and pinned submodules at short path
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+          New-Item -ItemType Directory -Force C:\b | Out-Null
+          git init $env:SOURCE_ROOT
+          git -C $env:SOURCE_ROOT config core.symlinks true
+          git -C $env:SOURCE_ROOT remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git"
+          git -C $env:SOURCE_ROOT fetch --no-tags --depth=2 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository fetch failed."
+          }
+
+          git -C $env:SOURCE_ROOT checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository checkout failed."
+          }
+
+          $parentCommit = (git -C $env:SOURCE_ROOT rev-parse "$($env:GITHUB_SHA)^").Trim()
+          if ($parentCommit -ne $env:PINNED_UPSTREAM_COMMIT) {
+            throw "Unexpected branch base: $parentCommit"
+          }
+
+          git -C $env:SOURCE_ROOT submodule sync --recursive
+          git -C $env:SOURCE_ROOT submodule update --init --recursive --depth=1 --jobs=4
+          if ($LASTEXITCODE -ne 0) {
+            throw "Submodule checkout failed."
+          }
+
+      - name: Verify stock source and generate VS2022 projects
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          $forbiddenFiles = @(
+            'code\client\shared\EarlyStartupTrace.h',
+            'code\client\shared\EarlyStartupRawTrace.h',
+            'code\tools\decode_early_startup_trace.py'
+          )
+
+          foreach ($file in $forbiddenFiles) {
+            if (Test-Path $file) {
+              throw "Unexpected diagnostic instrumentation file: $file"
+            }
+          }
+
+          git -C vendor\minhook diff --quiet
+          if ($LASTEXITCODE -ne 0) {
+            throw "MinHook differs from its pinned submodule commit."
+          }
+
+          $hookSource = Get-Content vendor\minhook\src\hook.c -Raw
+          if ($hookSource -match 'CfxEarlyRawTrace|EarlyStartup|FreezeEnter') {
+            throw "Unexpected MinHook diagnostic instrumentation found."
+          }
+
+          & .\fxd.ps1 gen -game five
+          if ($LASTEXITCODE -ne 0) {
+            throw "FiveM project generation failed."
+          }
+
+      - name: Audit CitiLaunch project-reference closure
+        shell: pwsh
+        run: |
+          $rootProject = Join-Path $env:SOURCE_ROOT 'code\build\five\CitiLaunch.vcxproj'
+          if (-not (Test-Path $rootProject)) {
+            throw "Generated CitiLaunch project was not found: $rootProject"
+          }
+
+          $pending = [System.Collections.Generic.Stack[string]]::new()
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $pending.Push($rootProject)
+
+          while ($pending.Count -gt 0) {
+            $project = [System.IO.Path]::GetFullPath($pending.Pop())
+            if (-not $seen.Add($project)) {
+              continue
+            }
+
+            [xml]$projectXml = Get-Content $project -Raw
+            foreach ($reference in $projectXml.SelectNodes("//*[local-name()='ProjectReference']")) {
+              $include = $reference.Include
+              if ($include -match '\$\(') {
+                throw "Unresolved project-reference path in $project: $include"
+              }
+
+              $referencedProject = [System.IO.Path]::GetFullPath(
+                (Join-Path (Split-Path $project -Parent) $include)
+              )
+
+              if (-not (Test-Path $referencedProject)) {
+                throw "Missing project reference: $referencedProject"
+              }
+
+              $pending.Push($referencedProject)
+            }
+          }
+
+          $closure = $seen | Sort-Object
+          $closure | ForEach-Object { Write-Host "CitiLaunch dependency: $_" }
+
+          $forbidden = $closure | Where-Object {
+            $_ -match '(?i)(CitiCore|CoreRT|legitimacy)'
+          }
+          if ($forbidden) {
+            throw "CitiLaunch unexpectedly references a closed/CoreRT project: $($forbidden -join ', ')"
+          }
+
+      - name: Build CitiLaunch Release x64
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+
+          $vsRoot = (& $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath).Trim()
+
+          if (-not $vsRoot) {
+            throw "Visual Studio 2022 with x64 C++ tools was not found."
+          }
+
+          $msbuild = Join-Path $vsRoot 'MSBuild\Current\Bin\MSBuild.exe'
+          $project = Join-Path $env:SOURCE_ROOT 'code\build\five\CitiLaunch.vcxproj'
+
+          $env:UseMultiToolTask = 'true'
+          $env:EnforceProcessCountAcrossBuilds = 'true'
+
+          & $msbuild $project `
+            /t:Build `
+            /m:4 `
+            /nr:false `
+            /v:minimal `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PreferredToolArchitecture=x64 `
+            "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION" `
+            /p:BuildProjectReferences=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CitiLaunch build failed with exit code $LASTEXITCODE."
+          }
+
+          $fiveM = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\FiveM.exe'
+          $pdb = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\dbg\FiveM.pdb'
+
+          if (-not (Test-Path $fiveM)) {
+            throw "Expected FiveM.exe was not produced: $fiveM"
+          }
+
+          if (-not (Test-Path $pdb)) {
+            throw "Expected FiveM.pdb was not produced: $pdb"
+          }
+
+      - name: Upload FiveM Release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FiveM-official-logger-delay-release
+          path: |
+            C:\b\five\code\bin\five\release\FiveM.exe
+            C:\b\five\code\bin\five\release\dbg\FiveM.pdb
+          if-no-files-found: error

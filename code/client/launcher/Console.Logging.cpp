@@ -173,7 +173,10 @@ struct LoggerInit
 	}
 };
 
-static LoggerInit logger;
+void StartLoggingThread()
+{
+	static LoggerInit logger;
+}
 
 extern "C" DLL_EXPORT void AsyncTrace(const char* string)
 {
