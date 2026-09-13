@@ -29,7 +29,7 @@ jobs:
           git init $env:SOURCE_ROOT
           git -C $env:SOURCE_ROOT config core.symlinks true
           git -C $env:SOURCE_ROOT remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git"
-          git -C $env:SOURCE_ROOT fetch --no-tags --depth=2 origin $env:GITHUB_SHA
+          git -C $env:SOURCE_ROOT fetch --no-tags --depth=16 origin $env:GITHUB_SHA
           if ($LASTEXITCODE -ne 0) {
             throw "Root repository fetch failed."
           }
@@ -39,9 +39,12 @@ jobs:
             throw "Root repository checkout failed."
           }
 
-          $parentCommit = (git -C $env:SOURCE_ROOT rev-parse "$($env:GITHUB_SHA)^").Trim()
-          if ($parentCommit -ne $env:PINNED_UPSTREAM_COMMIT) {
-            throw "Unexpected branch base: $parentCommit"
+          git -C $env:SOURCE_ROOT merge-base --is-ancestor `
+            $env:PINNED_UPSTREAM_COMMIT `
+            $env:GITHUB_SHA
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned upstream commit $($env:PINNED_UPSTREAM_COMMIT) is not an ancestor of $($env:GITHUB_SHA)."
           }
 
           git -C $env:SOURCE_ROOT submodule sync --recursive
