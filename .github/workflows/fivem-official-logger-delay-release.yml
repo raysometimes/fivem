@@ -3,7 +3,7 @@ name: FiveM official Wine CoreRT Release
 on:
   push:
     branches:
-      - diagnostics/official-wine-corert
+      - diagnostics/official-corert-control
 
 permissions:
   contents: read
@@ -272,7 +272,7 @@ jobs:
       - name: Upload FiveM and CoreRT Release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FiveM-official-wine-corert-release
+          name: FiveM-official-corert-control-release
           path: |
             C:\b\five\code\bin\five\release\FiveM.exe
             C:\b\five\code\bin\five\release\dbg\FiveM.pdb
