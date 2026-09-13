@@ -1,9 +1,9 @@
-name: FiveM official logger-delay Release
+name: FiveM official Wine CoreRT Release
 
 on:
   push:
     branches:
-      - diagnostics/official-logger-delay
+      - diagnostics/official-wine-corert
 
 permissions:
   contents: read
@@ -52,6 +52,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Submodule checkout failed."
           }
+
+      - name: Generate udis86 tables required by CitiCore
+        shell: cmd
+        working-directory: 'C:\b\five'
+        run: |
+          call code\prebuild_udis86.cmd
+          if errorlevel 1 exit /b 1
+          if not exist vendor\udis86\libudis86\itab.c exit /b 1
+          if not exist vendor\udis86\libudis86\itab.h exit /b 1
 
       - name: Verify stock source and generate VS2022 projects
         shell: pwsh
@@ -131,7 +140,54 @@ jobs:
             throw "CitiLaunch unexpectedly references a closed/CoreRT project: $($forbidden -join ', ')"
           }
 
-      - name: Build CitiLaunch Release x64
+      - name: Audit CitiCore project-reference closure
+        shell: pwsh
+        run: |
+          $rootProject = Join-Path $env:SOURCE_ROOT 'code\build\five\CitiCore.vcxproj'
+          if (-not (Test-Path $rootProject)) {
+            throw "Generated CitiCore project was not found: $rootProject"
+          }
+
+          $pending = [System.Collections.Generic.Stack[string]]::new()
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $pending.Push($rootProject)
+
+          while ($pending.Count -gt 0) {
+            $project = [System.IO.Path]::GetFullPath($pending.Pop())
+            if (-not $seen.Add($project)) {
+              continue
+            }
+
+            [xml]$projectXml = Get-Content $project -Raw
+            foreach ($reference in $projectXml.SelectNodes("//*[local-name()='ProjectReference']")) {
+              $include = $reference.Include
+              if ($include -match '\$\(') {
+                throw "Unresolved project-reference path in ${project}: $include"
+              }
+
+              $referencedProject = [System.IO.Path]::GetFullPath(
+                (Join-Path (Split-Path $project -Parent) $include)
+              )
+
+              if (-not (Test-Path $referencedProject)) {
+                throw "Missing project reference: $referencedProject"
+              }
+
+              $pending.Push($referencedProject)
+            }
+          }
+
+          $closure = $seen | Sort-Object
+          $closure | ForEach-Object { Write-Host "CitiCore dependency: $_" }
+
+          $forbidden = $closure | Where-Object {
+            $_ -match '(?i)legitimacy'
+          }
+          if ($forbidden) {
+            throw "CitiCore unexpectedly references legitimacy: $($forbidden -join ', ')"
+          }
+
+      - name: Build CitiLaunch and CitiCore Release x64
         shell: pwsh
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} `
@@ -148,12 +204,13 @@ jobs:
           }
 
           $msbuild = Join-Path $vsRoot 'MSBuild\Current\Bin\MSBuild.exe'
-          $project = Join-Path $env:SOURCE_ROOT 'code\build\five\CitiLaunch.vcxproj'
+          $launcherProject = Join-Path $env:SOURCE_ROOT 'code\build\five\CitiLaunch.vcxproj'
+          $coreProject = Join-Path $env:SOURCE_ROOT 'code\build\five\CitiCore.vcxproj'
 
           $env:UseMultiToolTask = 'true'
           $env:EnforceProcessCountAcrossBuilds = 'true'
 
-          & $msbuild $project `
+          & $msbuild $launcherProject `
             /t:Build `
             /m:4 `
             /nr:false `
@@ -168,22 +225,49 @@ jobs:
             throw "CitiLaunch build failed with exit code $LASTEXITCODE."
           }
 
+          & $msbuild $coreProject `
+            /t:Build `
+            /m:4 `
+            /nr:false `
+            /v:minimal `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PreferredToolArchitecture=x64 `
+            "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION" `
+            /p:BuildProjectReferences=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CitiCore build failed with exit code $LASTEXITCODE."
+          }
+
           $fiveM = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\FiveM.exe'
-          $pdb = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\dbg\FiveM.pdb'
+          $fiveMPdb = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\dbg\FiveM.pdb'
+          $coreRT = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\CoreRT.dll'
+          $coreRTPdb = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\dbg\CoreRT.pdb'
 
           if (-not (Test-Path $fiveM)) {
             throw "Expected FiveM.exe was not produced: $fiveM"
           }
 
-          if (-not (Test-Path $pdb)) {
-            throw "Expected FiveM.pdb was not produced: $pdb"
+          if (-not (Test-Path $fiveMPdb)) {
+            throw "Expected FiveM.pdb was not produced: $fiveMPdb"
           }
 
-      - name: Upload FiveM Release artifacts
+          if (-not (Test-Path $coreRT)) {
+            throw "Expected CoreRT.dll was not produced: $coreRT"
+          }
+
+          if (-not (Test-Path $coreRTPdb)) {
+            throw "Expected CoreRT.pdb was not produced: $coreRTPdb"
+          }
+
+      - name: Upload FiveM and CoreRT Release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FiveM-official-logger-delay-release
+          name: FiveM-official-wine-corert-release
           path: |
             C:\b\five\code\bin\five\release\FiveM.exe
             C:\b\five\code\bin\five\release\dbg\FiveM.pdb
+            C:\b\five\code\bin\five\release\CoreRT.dll
+            C:\b\five\code\bin\five\release\dbg\CoreRT.pdb
           if-no-files-found: error

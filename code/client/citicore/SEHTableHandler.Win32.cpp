@@ -141,6 +141,7 @@ static void* RtlpxLookupFunctionTableOverrideDownLevel(void* exceptionAddress, P
 }
 
 #include <winternl.h>
+#include <LaunchMode.h>
 
 static PVOID(*g_origRtlImageDirectoryEntryToData)(HMODULE hModule, BOOL a2, WORD directory, ULONG* a4);
 
@@ -188,7 +189,7 @@ extern "C" void DLL_EXPORT CoreRT_SetupSEHHandler(void* moduleBase, void* module
 	// find the location to hook (RtlpxLookupFunctionTable from RtlLookupFunctionTable)
 	void* baseAddress = GetProcAddress(GetModuleHandle(L"ntdll.dll"), "RtlLookupFunctionTable");
 
-	if (baseAddress && GetModuleHandle(L"xtajit64.dll") == nullptr)
+	if (baseAddress && !CfxIsWine() && GetModuleHandle(L"xtajit64.dll") == nullptr)
 	{
 		void* internalAddress = FindCallFromAddress(baseAddress);
 
