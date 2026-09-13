@@ -160,6 +160,14 @@ jobs:
             throw "Generated projects unexpectedly reference the old C:\fivem-wine tree."
           }
 
+      - name: Install nui-core code-generation Python dependencies
+        shell: pwsh
+        run: |
+          py -3 -m pip install Jinja2 MarkupSafe "ply>=3.6,<4.0" six
+          if ($LASTEXITCODE -ne 0) {
+            throw "nui-core Python dependency installation failed with exit code $LASTEXITCODE."
+          }
+
       - name: Audit nui-core project and dependency closure
         shell: pwsh
         run: |
