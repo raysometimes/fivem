@@ -1,0 +1,374 @@
+name: FiveM official Wine NUI Geometry Log
+
+on:
+  push:
+    branches:
+      - diagnostics/official-wine-nui-geometry-log
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      SOURCE_ROOT: 'C:\b\five'
+      WINDOWS_SDK_VERSION: '10.0.22621.0'
+      PINNED_UPSTREAM_COMMIT: '0d8a2a6f78a9922445d8930305af82a7b1826980'
+      EXPERIMENT_BASE_COMMIT: 'f6740b955b213565486a9060b53f1ea6ddae3e45'
+
+    steps:
+      - name: Checkout repository and pinned submodules at short path
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+          New-Item -ItemType Directory -Force C:\b | Out-Null
+          git init $env:SOURCE_ROOT
+          git -C $env:SOURCE_ROOT config core.symlinks true
+          git -C $env:SOURCE_ROOT remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git"
+          git -C $env:SOURCE_ROOT fetch --no-tags --depth=16 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository fetch failed."
+          }
+
+          git -C $env:SOURCE_ROOT checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository checkout failed."
+          }
+
+          git -C $env:SOURCE_ROOT merge-base --is-ancestor `
+            $env:PINNED_UPSTREAM_COMMIT `
+            $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned upstream commit $($env:PINNED_UPSTREAM_COMMIT) is not an ancestor of $($env:GITHUB_SHA)."
+          }
+
+          git -C $env:SOURCE_ROOT merge-base --is-ancestor `
+            $env:EXPERIMENT_BASE_COMMIT `
+            $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Experiment base $($env:EXPERIMENT_BASE_COMMIT) is not an ancestor of $($env:GITHUB_SHA)."
+          }
+
+          git -C $env:SOURCE_ROOT submodule sync --recursive
+          git -C $env:SOURCE_ROOT submodule update --init --recursive --depth=1 --jobs=4
+          if ($LASTEXITCODE -ne 0) {
+            throw "Submodule checkout failed."
+          }
+
+      - name: Download pinned CEF dependency
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 get-chrome
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned CEF dependency setup failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Audit experiment identity and source delta
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          $headCommit = (git rev-parse HEAD).Trim()
+          $parentCommit = (git rev-parse "$($env:GITHUB_SHA)^").Trim()
+          $branchName = $env:GITHUB_REF_NAME
+
+          Write-Host "Branch: $branchName"
+          Write-Host "HEAD SHA: $headCommit"
+          Write-Host "Parent SHA: $parentCommit"
+          Write-Host "Experiment base SHA: $($env:EXPERIMENT_BASE_COMMIT)"
+          Write-Host "Pinned upstream SHA: $($env:PINNED_UPSTREAM_COMMIT)"
+
+          if ($headCommit -ne $env:GITHUB_SHA) {
+            throw "Checked-out HEAD $headCommit does not match GITHUB_SHA $($env:GITHUB_SHA)."
+          }
+
+          $allowedFiles = @(
+            '.github/workflows/fivem-official-wine-nui-geometry-log.yml',
+            'code/components/nui-core/src/NUIWindow.cpp'
+          )
+          $changedFiles = @(git diff --name-only $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to enumerate the experiment delta."
+          }
+
+          Write-Host 'Files changed from experiment base:'
+          $changedFiles | ForEach-Object { Write-Host "  $_" }
+
+          $unexpectedFiles = @($changedFiles | Where-Object { $_ -notin $allowedFiles })
+          if ($unexpectedFiles.Count -ne 0) {
+            throw "Unexpected files differ from the experiment base: $($unexpectedFiles -join ', ')"
+          }
+
+          foreach ($requiredFile in $allowedFiles) {
+            if ($requiredFile -notin $changedFiles) {
+              throw "Required experiment file is absent from the base delta: $requiredFile"
+            }
+          }
+
+          Write-Host 'Full experiment diff:'
+          git --no-pager diff --no-ext-diff --stat $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA
+          git --no-pager diff --no-ext-diff $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to print the experiment diff."
+          }
+
+          $nuiPath = Join-Path $env:SOURCE_ROOT 'code\components\nui-core\src\NUIWindow.cpp'
+          $nuiSource = Get-Content $nuiPath -Raw
+          $enabledAssignment = 'info.shared_texture_enabled = nuiSharedResourcesEnabled;'
+          $guardedAssignment = 'info.shared_texture_enabled = (!CfxIsWine() && nuiSharedResourcesEnabled);'
+
+          if ([regex]::Matches($nuiSource, [regex]::Escape($enabledAssignment)).Count -ne 1) {
+            throw "The enabled shared-texture assignment is missing or duplicated."
+          }
+          if ($nuiSource.Contains($guardedAssignment)) {
+            throw "The Wine-disabled shared-texture assignment is still present."
+          }
+
+          $requiredDiagnosticSource = @(
+            'const HWND hwnd = g_nuiGi->GetHWND();',
+            'const BOOL clientRectValid = GetClientRect(hwnd, &clientRect);',
+            'const BOOL windowRectValid = GetWindowRect(hwnd, &windowRect);',
+            'static bool hasPreviousGeometry = false;',
+            'if (geometryChanged)',
+            'SetLastError(previousLastError);'
+          )
+          foreach ($sourceLine in $requiredDiagnosticSource) {
+            if ([regex]::Matches($nuiSource, [regex]::Escape($sourceLine)).Count -ne 1) {
+              throw "Required geometry diagnostic source is missing or duplicated: $sourceLine"
+            }
+          }
+          if ([regex]::Matches($nuiSource, [regex]::Escape('[WineGeometry]')).Count -ne 1) {
+            throw "The [WineGeometry] marker is missing or duplicated."
+          }
+
+          $corePath = Join-Path $env:SOURCE_ROOT 'code\client\citicore\SEHTableHandler.Win32.cpp'
+          $coreSource = Get-Content $corePath -Raw
+          if (-not $coreSource.Contains('#include <LaunchMode.h>')) {
+            throw "The proven CoreRT Wine include is missing."
+          }
+          if (-not $coreSource.Contains('if (baseAddress && !CfxIsWine() && GetModuleHandle(L"xtajit64.dll") == nullptr)')) {
+            throw "The proven CoreRT Wine guard is missing."
+          }
+
+          $forbiddenFiles = @(
+            'code\client\shared\EarlyStartupTrace.h',
+            'code\client\shared\EarlyStartupRawTrace.h',
+            'code\tools\decode_early_startup_trace.py'
+          )
+          foreach ($file in $forbiddenFiles) {
+            if (Test-Path $file) {
+              throw "Unexpected diagnostic instrumentation file: $file"
+            }
+          }
+
+          git -C vendor\minhook diff --quiet
+          if ($LASTEXITCODE -ne 0) {
+            throw "MinHook differs from its pinned submodule commit."
+          }
+
+      - name: Generate VS2022 projects
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 gen -game five
+          if ($LASTEXITCODE -ne 0) {
+            throw "FiveM project generation failed."
+          }
+
+          $oldTreeReferences = Get-ChildItem 'code\build\five' -Filter '*.vcxproj' -File |
+            Select-String -SimpleMatch 'C:\fivem-wine'
+          if ($oldTreeReferences) {
+            throw "Generated projects unexpectedly reference the old C:\fivem-wine tree."
+          }
+
+      - name: Install nui-core code-generation Python dependencies
+        shell: pwsh
+        run: |
+          py -3 -m pip install Jinja2 MarkupSafe "ply>=3.6,<4.0" six
+          if ($LASTEXITCODE -ne 0) {
+            throw "nui-core Python dependency installation failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Audit nui-core project and dependency closure
+        shell: pwsh
+        run: |
+          $rootProject = Join-Path $env:SOURCE_ROOT 'code\build\five\nui-core.vcxproj'
+          if (-not (Test-Path $rootProject)) {
+            throw "Generated nui-core project was not found: $rootProject"
+          }
+
+          [xml]$rootProjectXml = Get-Content $rootProject -Raw
+          $projectDirectory = Split-Path $rootProject -Parent
+          $expectedSource = [System.IO.Path]::GetFullPath(
+            (Join-Path $env:SOURCE_ROOT 'code\components\nui-core\src\NUIWindow.cpp')
+          )
+          $compiledSources = @(
+            $rootProjectXml.SelectNodes("//*[local-name()='ClCompile']") |
+              ForEach-Object {
+                [System.IO.Path]::GetFullPath((Join-Path $projectDirectory $_.Include))
+              }
+          )
+          if (@($compiledSources | Where-Object { $_ -eq $expectedSource }).Count -ne 1) {
+            throw "NUIWindow.cpp is not compiled exactly once by $rootProject."
+          }
+
+          $releasePropertyGroup = @(
+            $rootProjectXml.SelectNodes("//*[local-name()='PropertyGroup']") |
+              Where-Object { $_.Condition -like '*Release|x64*' -and $_.OutDir }
+          )
+          if ($releasePropertyGroup.Count -ne 1) {
+            throw "Unable to identify one Release x64 output property group."
+          }
+
+          $outDir = [string]$releasePropertyGroup[0].OutDir
+          $targetName = [string]$releasePropertyGroup[0].TargetName
+          $targetExt = [string]$releasePropertyGroup[0].TargetExt
+          $resolvedOutDir = [System.IO.Path]::GetFullPath((Join-Path $projectDirectory $outDir))
+          $dllPath = Join-Path $resolvedOutDir "$targetName$targetExt"
+          $pdbPath = Join-Path $resolvedOutDir "dbg\$targetName.pdb"
+
+          if ($targetName -ne 'nui-core' -or $targetExt -ne '.dll') {
+            throw "Unexpected nui-core target identity: $targetName$targetExt"
+          }
+
+          Write-Host "Exact project: $rootProject"
+          Write-Host "Exact output DLL: $dllPath"
+          Write-Host "Exact output PDB: $pdbPath"
+
+          $pending = [System.Collections.Generic.Stack[string]]::new()
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $pending.Push($rootProject)
+
+          while ($pending.Count -gt 0) {
+            $project = [System.IO.Path]::GetFullPath($pending.Pop())
+            if (-not $seen.Add($project)) {
+              continue
+            }
+
+            [xml]$projectXml = Get-Content $project -Raw
+            foreach ($reference in $projectXml.SelectNodes("//*[local-name()='ProjectReference']")) {
+              $include = $reference.Include
+              if ($include -match '\$\(') {
+                throw "Unresolved project-reference path in ${project}: $include"
+              }
+
+              $referencedProject = [System.IO.Path]::GetFullPath(
+                (Join-Path (Split-Path $project -Parent) $include)
+              )
+              if (-not (Test-Path $referencedProject)) {
+                throw "Missing project reference: $referencedProject"
+              }
+              $pending.Push($referencedProject)
+            }
+          }
+
+          $closure = @($seen | Sort-Object)
+          $closure | ForEach-Object { Write-Host "nui-core dependency: $_" }
+
+          $unexpectedRuntimeProjects = @($closure | Where-Object {
+            [System.IO.Path]::GetFileName($_) -match '^(CitiLaunch|CitiCore)\.vcxproj$'
+          })
+          if ($unexpectedRuntimeProjects.Count -ne 0) {
+            throw "nui-core unexpectedly rebuilds launcher/CoreRT projects: $($unexpectedRuntimeProjects -join ', ')"
+          }
+
+          $legitimacyProjects = @($closure | Where-Object {
+            [System.IO.Path]::GetFileName($_) -ieq 'legitimacy.vcxproj'
+          })
+          if ($legitimacyProjects.Count -ne 1) {
+            throw "Expected exactly one bundled legitimacy utility dependency."
+          }
+
+          [xml]$legitimacyXml = Get-Content $legitimacyProjects[0] -Raw
+          $legitimacyTypes = @(
+            $legitimacyXml.SelectNodes("//*[local-name()='ConfigurationType']") |
+              ForEach-Object { $_.'#text' } |
+              Sort-Object -Unique
+          )
+          $legitimacyCompileItems = @($legitimacyXml.SelectNodes("//*[local-name()='ClCompile']"))
+          if ($legitimacyTypes.Count -ne 1 -or $legitimacyTypes[0] -ne 'Utility') {
+            throw "legitimacy is not the expected bundled Utility project."
+          }
+          if ($legitimacyCompileItems.Count -ne 0) {
+            throw "The bundled legitimacy project unexpectedly contains compile items."
+          }
+          Write-Host 'legitimacy is a pinned prebuilt Utility dependency; it is not compiled or packaged.'
+
+      - name: Build only nui-core Release x64 and its project references
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = (& $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath).Trim()
+          if (-not $vsRoot) {
+            throw "Visual Studio 2022 with x64 C++ tools was not found."
+          }
+
+          $msbuild = Join-Path $vsRoot 'MSBuild\Current\Bin\MSBuild.exe'
+          $nuiProject = Join-Path $env:SOURCE_ROOT 'code\build\five\nui-core.vcxproj'
+
+          $env:UseMultiToolTask = 'true'
+          $env:EnforceProcessCountAcrossBuilds = 'true'
+
+          & $msbuild $nuiProject `
+            /t:Build `
+            /m:4 `
+            /nr:false `
+            /v:minimal `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PreferredToolArchitecture=x64 `
+            "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION" `
+            /p:BuildProjectReferences=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "nui-core build failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Report and verify release outputs
+        shell: pwsh
+        run: |
+          $dllPath = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\nui-core.dll'
+          $pdbPath = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\dbg\nui-core.pdb'
+
+          foreach ($path in @($dllPath, $pdbPath)) {
+            if (-not (Test-Path $path)) {
+              throw "Expected output was not produced: $path"
+            }
+          }
+
+          $dllHash = (Get-FileHash $dllPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $pdbHash = (Get-FileHash $pdbPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $fileVersion = (Get-Item $dllPath).VersionInfo.FileVersion
+
+          Write-Host "Branch: $($env:GITHUB_REF_NAME)"
+          Write-Host "HEAD SHA: $($env:GITHUB_SHA)"
+          Write-Host "Pinned upstream SHA: $($env:PINNED_UPSTREAM_COMMIT)"
+          Write-Host "Built project: $($env:SOURCE_ROOT)\code\build\five\nui-core.vcxproj"
+          Write-Host "DLL path: $dllPath"
+          Write-Host "DLL SHA256: $dllHash"
+          Write-Host "PDB path: $pdbPath"
+          Write-Host "PDB SHA256: $pdbHash"
+          if ($fileVersion) {
+            Write-Host "DLL file version: $fileVersion"
+          } else {
+            Write-Host 'DLL file version: <not present>'
+          }
+
+      - name: Upload Wine NUI geometry log artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FiveM-official-wine-nui-geometry-log
+          path: |
+            C:\b\five\code\bin\five\release\nui-core.dll
+            C:\b\five\code\bin\five\release\dbg\nui-core.pdb
+          if-no-files-found: error

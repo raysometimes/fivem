@@ -566,6 +566,109 @@ void NUIWindow::UpdateFrame()
 		int resX, resY;
 		g_nuiGi->GetGameResolution(&resX, &resY);
 
+		const DWORD previousLastError = GetLastError();
+		const HWND hwnd = g_nuiGi->GetHWND();
+		RECT clientRect = {};
+		RECT windowRect = {};
+		const BOOL clientRectValid = GetClientRect(hwnd, &clientRect);
+		const DWORD clientRectError = clientRectValid ? ERROR_SUCCESS : GetLastError();
+		const BOOL windowRectValid = GetWindowRect(hwnd, &windowRect);
+		const DWORD windowRectError = windowRectValid ? ERROR_SUCCESS : GetLastError();
+
+		struct GeometrySnapshot
+		{
+			int gameWidth;
+			int gameHeight;
+			LONG clientLeft;
+			LONG clientTop;
+			LONG clientRight;
+			LONG clientBottom;
+			LONG windowLeft;
+			LONG windowTop;
+			LONG windowRight;
+			LONG windowBottom;
+			int nuiWidth;
+			int nuiHeight;
+			HWND hwnd;
+			BOOL clientRectValid;
+			BOOL windowRectValid;
+			DWORD clientRectError;
+			DWORD windowRectError;
+		};
+
+		const GeometrySnapshot geometry = {
+			resX,
+			resY,
+			clientRect.left,
+			clientRect.top,
+			clientRect.right,
+			clientRect.bottom,
+			windowRect.left,
+			windowRect.top,
+			windowRect.right,
+			windowRect.bottom,
+			m_width,
+			m_height,
+			hwnd,
+			clientRectValid,
+			windowRectValid,
+			clientRectError,
+			windowRectError
+		};
+
+		static bool hasPreviousGeometry = false;
+		static GeometrySnapshot previousGeometry = {};
+		const bool geometryChanged =
+			!hasPreviousGeometry ||
+			geometry.gameWidth != previousGeometry.gameWidth ||
+			geometry.gameHeight != previousGeometry.gameHeight ||
+			geometry.clientLeft != previousGeometry.clientLeft ||
+			geometry.clientTop != previousGeometry.clientTop ||
+			geometry.clientRight != previousGeometry.clientRight ||
+			geometry.clientBottom != previousGeometry.clientBottom ||
+			geometry.windowLeft != previousGeometry.windowLeft ||
+			geometry.windowTop != previousGeometry.windowTop ||
+			geometry.windowRight != previousGeometry.windowRight ||
+			geometry.windowBottom != previousGeometry.windowBottom ||
+			geometry.nuiWidth != previousGeometry.nuiWidth ||
+			geometry.nuiHeight != previousGeometry.nuiHeight ||
+			geometry.hwnd != previousGeometry.hwnd ||
+			geometry.clientRectValid != previousGeometry.clientRectValid ||
+			geometry.windowRectValid != previousGeometry.windowRectValid ||
+			geometry.clientRectError != previousGeometry.clientRectError ||
+			geometry.windowRectError != previousGeometry.windowRectError;
+
+		if (geometryChanged)
+		{
+			trace("[WineGeometry] game=%dx%d client=%ldx%ld clientRect=(%ld,%ld,%ld,%ld) clientOk=%d clientError=%lu window=%ldx%ld windowRect=(%ld,%ld,%ld,%ld) windowOk=%d windowError=%lu nui=%dx%d hwnd=%p\n",
+				geometry.gameWidth,
+				geometry.gameHeight,
+				geometry.clientRight - geometry.clientLeft,
+				geometry.clientBottom - geometry.clientTop,
+				geometry.clientLeft,
+				geometry.clientTop,
+				geometry.clientRight,
+				geometry.clientBottom,
+				geometry.clientRectValid,
+				geometry.clientRectError,
+				geometry.windowRight - geometry.windowLeft,
+				geometry.windowBottom - geometry.windowTop,
+				geometry.windowLeft,
+				geometry.windowTop,
+				geometry.windowRight,
+				geometry.windowBottom,
+				geometry.windowRectValid,
+				geometry.windowRectError,
+				geometry.nuiWidth,
+				geometry.nuiHeight,
+				(void*)geometry.hwnd);
+
+			previousGeometry = geometry;
+			hasPreviousGeometry = true;
+		}
+
+		SetLastError(previousLastError);
+
 		if (IsFixedSizeWindow())
 		{
 			resX = 1920;
