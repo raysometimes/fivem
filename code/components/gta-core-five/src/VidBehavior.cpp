@@ -8,6 +8,7 @@
 #include <Hooking.h>
 
 #include <CrossBuildRuntime.h>
+#include <LaunchMode.h>
 #include <MinHook.h>
 
 #include <boost/algorithm/string.hpp>
@@ -41,6 +42,56 @@ static bool IsNewInstall()
 }
 
 static bool isNewSettingFile;
+
+static decltype(&EnumDisplaySettingsW) g_origEnumDisplaySettingsW;
+static decltype(&QueryDisplayConfig) g_origQueryDisplayConfig;
+
+static BOOL WINAPI NormalizeEnumDisplaySettingsW(LPCWSTR deviceName, DWORD modeNum, DEVMODEW* mode)
+{
+	const BOOL result = g_origEnumDisplaySettingsW(deviceName, modeNum, mode);
+	const DWORD lastError = GetLastError();
+
+	if (result && mode && (mode->dmFields & DM_DISPLAYORIENTATION) && mode->dmDisplayOrientation == DMDO_270)
+	{
+		mode->dmDisplayOrientation = DMDO_DEFAULT;
+		trace("[WineDeckOrientationCompat] api=EnumDisplaySettingsW normalized GTA display orientation\n");
+	}
+
+	SetLastError(lastError);
+	return result;
+}
+
+static LONG WINAPI NormalizeQueryDisplayConfig(UINT32 flags, UINT32* numPathArrayElements, DISPLAYCONFIG_PATH_INFO* pathArray, UINT32* numModeInfoArrayElements, DISPLAYCONFIG_MODE_INFO* modeInfoArray, DISPLAYCONFIG_TOPOLOGY_ID* currentTopologyId)
+{
+	const UINT32 pathCapacity = numPathArrayElements ? *numPathArrayElements : 0;
+	const LONG result = g_origQueryDisplayConfig(flags, numPathArrayElements, pathArray, numModeInfoArrayElements, modeInfoArray, currentTopologyId);
+	const DWORD lastError = GetLastError();
+
+	if (result == ERROR_SUCCESS && pathArray && numPathArrayElements)
+	{
+		const UINT32 pathCount = *numPathArrayElements;
+		if (pathCount <= pathCapacity)
+		{
+			bool normalized = false;
+			for (UINT32 i = 0; i < pathCount; ++i)
+			{
+				if (pathArray[i].targetInfo.rotation == DISPLAYCONFIG_ROTATION_ROTATE270)
+				{
+					pathArray[i].targetInfo.rotation = DISPLAYCONFIG_ROTATION_IDENTITY;
+					normalized = true;
+				}
+			}
+
+			if (normalized)
+			{
+				trace("[WineDeckOrientationCompat] api=QueryDisplayConfig normalized GTA display orientation\n");
+			}
+		}
+	}
+
+	SetLastError(lastError);
+	return result;
+}
 
 static hook::cdecl_stub<bool(void*, void*)> _saveSettings([]()
 {
@@ -103,6 +154,12 @@ namespace WRL = Microsoft::WRL;
 
 static HookFunction hookFunction([]()
 {
+	if (CfxIsWine())
+	{
+		g_origEnumDisplaySettingsW = hook::iat("user32.dll", NormalizeEnumDisplaySettingsW, "EnumDisplaySettingsW");
+		g_origQueryDisplayConfig = hook::iat("user32.dll", NormalizeQueryDisplayConfig, "QueryDisplayConfig");
+	}
+
 	// settings.xml moving for new installs
 	if (IsNewInstall())
 	{
