@@ -8,6 +8,7 @@
 #include <Hooking.h>
 
 #include <CrossBuildRuntime.h>
+#include <LaunchMode.h>
 #include <MinHook.h>
 
 #include <boost/algorithm/string.hpp>
@@ -42,6 +43,571 @@ static bool IsNewInstall()
 
 static bool isNewSettingFile;
 
+static uint8_t* g_displayTraceGameBase;
+static size_t g_displayTraceGameSize;
+
+static decltype(&EnumDisplaySettingsW) g_origEnumDisplaySettingsW;
+static decltype(&EnumDisplayDevicesA) g_origEnumDisplayDevicesA;
+static decltype(&GetMonitorInfoA) g_origGetMonitorInfoA;
+static decltype(&MonitorFromPoint) g_origMonitorFromPoint;
+static decltype(&GetSystemMetrics) g_origGetSystemMetrics;
+static decltype(&QueryDisplayConfig) g_origQueryDisplayConfig;
+static decltype(&DisplayConfigGetDeviceInfo) g_origDisplayConfigGetDeviceInfo;
+static decltype(&GetDeviceCaps) g_origGetDeviceCaps;
+
+static bool GetDisplayTraceCaller(void* caller, uintptr_t* callerRva)
+{
+	const auto address = reinterpret_cast<uintptr_t>(caller);
+	const auto base = reinterpret_cast<uintptr_t>(g_displayTraceGameBase);
+
+	if (!base || address < base || address >= (base + g_displayTraceGameSize))
+	{
+		return false;
+	}
+
+	*callerRva = address - base;
+	return true;
+}
+
+static const char* GetDisplayModeName(DWORD modeNum)
+{
+	if (modeNum == ENUM_CURRENT_SETTINGS)
+	{
+		return "ENUM_CURRENT_SETTINGS";
+	}
+
+	if (modeNum == ENUM_REGISTRY_SETTINGS)
+	{
+		return "ENUM_REGISTRY_SETTINGS";
+	}
+
+	return "INDEX";
+}
+
+static BOOL WINAPI TraceEnumDisplaySettingsW(LPCWSTR deviceName, DWORD modeNum, DEVMODEW* mode)
+{
+	void* caller = _ReturnAddress();
+	const BOOL result = g_origEnumDisplaySettingsW(deviceName, modeNum, mode);
+	const DWORD apiLastError = GetLastError();
+	uintptr_t callerRva;
+
+	if (GetDisplayTraceCaller(caller, &callerRva))
+	{
+		if (result && mode)
+		{
+			trace("[WineDisplayApi] api=EnumDisplaySettingsW device=%ls mode=%s modeValue=0x%08lx result=%d width=%lu height=%lu orientation=%lu frequency=%lu fields=0x%08lx position=(%ld,%ld) bitsPerPel=%lu flags=0x%08lx callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+				deviceName ? deviceName : L"<null>",
+				GetDisplayModeName(modeNum),
+				static_cast<unsigned long>(modeNum),
+				result,
+				static_cast<unsigned long>(mode->dmPelsWidth),
+				static_cast<unsigned long>(mode->dmPelsHeight),
+				static_cast<unsigned long>(mode->dmDisplayOrientation),
+				static_cast<unsigned long>(mode->dmDisplayFrequency),
+				static_cast<unsigned long>(mode->dmFields),
+				static_cast<long>(mode->dmPosition.x),
+				static_cast<long>(mode->dmPosition.y),
+				static_cast<unsigned long>(mode->dmBitsPerPel),
+				static_cast<unsigned long>(mode->dmDisplayFlags),
+				caller,
+				static_cast<unsigned long long>(callerRva),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+		}
+		else
+		{
+			trace("[WineDisplayApi] api=EnumDisplaySettingsW device=%ls mode=%s modeValue=0x%08lx result=%d lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+				deviceName ? deviceName : L"<null>",
+				GetDisplayModeName(modeNum),
+				static_cast<unsigned long>(modeNum),
+				result,
+				static_cast<unsigned long>(apiLastError),
+				caller,
+				static_cast<unsigned long long>(callerRva),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+		}
+	}
+
+	SetLastError(apiLastError);
+	return result;
+}
+
+static BOOL WINAPI TraceEnumDisplayDevicesA(LPCSTR deviceName, DWORD deviceNum, PDISPLAY_DEVICEA displayDevice, DWORD flags)
+{
+	void* caller = _ReturnAddress();
+	const BOOL result = g_origEnumDisplayDevicesA(deviceName, deviceNum, displayDevice, flags);
+	const DWORD apiLastError = GetLastError();
+	uintptr_t callerRva;
+
+	if (GetDisplayTraceCaller(caller, &callerRva))
+	{
+		if (result && displayDevice)
+		{
+			trace("[WineDisplayApi] api=EnumDisplayDevicesA device=%s deviceNum=%lu flags=0x%08lx result=%d outName=%s outString=%s stateFlags=0x%08lx outId=%s outKey=%s callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+				deviceName ? deviceName : "<null>",
+				static_cast<unsigned long>(deviceNum),
+				static_cast<unsigned long>(flags),
+				result,
+				displayDevice->DeviceName,
+				displayDevice->DeviceString,
+				static_cast<unsigned long>(displayDevice->StateFlags),
+				displayDevice->DeviceID,
+				displayDevice->DeviceKey,
+				caller,
+				static_cast<unsigned long long>(callerRva),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+		}
+		else
+		{
+			trace("[WineDisplayApi] api=EnumDisplayDevicesA device=%s deviceNum=%lu flags=0x%08lx result=%d lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+				deviceName ? deviceName : "<null>",
+				static_cast<unsigned long>(deviceNum),
+				static_cast<unsigned long>(flags),
+				result,
+				static_cast<unsigned long>(apiLastError),
+				caller,
+				static_cast<unsigned long long>(callerRva),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+		}
+	}
+
+	SetLastError(apiLastError);
+	return result;
+}
+
+static BOOL WINAPI TraceGetMonitorInfoA(HMONITOR monitor, LPMONITORINFO monitorInfo)
+{
+	void* caller = _ReturnAddress();
+	const DWORD inputSize = monitorInfo ? monitorInfo->cbSize : 0;
+	const BOOL result = g_origGetMonitorInfoA(monitor, monitorInfo);
+	const DWORD apiLastError = GetLastError();
+	uintptr_t callerRva;
+
+	if (GetDisplayTraceCaller(caller, &callerRva))
+	{
+		if (result && monitorInfo)
+		{
+			if (inputSize >= sizeof(MONITORINFOEXA))
+			{
+				const auto monitorInfoEx = reinterpret_cast<const MONITORINFOEXA*>(monitorInfo);
+				trace("[WineDisplayApi] api=GetMonitorInfoA monitor=%p cbSize=%lu result=%d rcMonitor=(%ld,%ld,%ld,%ld) rcWork=(%ld,%ld,%ld,%ld) flags=0x%08lx device=%s callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					static_cast<void*>(monitor),
+					static_cast<unsigned long>(inputSize),
+					result,
+					monitorInfo->rcMonitor.left,
+					monitorInfo->rcMonitor.top,
+					monitorInfo->rcMonitor.right,
+					monitorInfo->rcMonitor.bottom,
+					monitorInfo->rcWork.left,
+					monitorInfo->rcWork.top,
+					monitorInfo->rcWork.right,
+					monitorInfo->rcWork.bottom,
+					static_cast<unsigned long>(monitorInfo->dwFlags),
+					monitorInfoEx->szDevice,
+					caller,
+					static_cast<unsigned long long>(callerRva),
+					static_cast<unsigned long>(GetCurrentThreadId()));
+			}
+			else
+			{
+				trace("[WineDisplayApi] api=GetMonitorInfoA monitor=%p cbSize=%lu result=%d rcMonitor=(%ld,%ld,%ld,%ld) rcWork=(%ld,%ld,%ld,%ld) flags=0x%08lx device=<unavailable> callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					static_cast<void*>(monitor),
+					static_cast<unsigned long>(inputSize),
+					result,
+					monitorInfo->rcMonitor.left,
+					monitorInfo->rcMonitor.top,
+					monitorInfo->rcMonitor.right,
+					monitorInfo->rcMonitor.bottom,
+					monitorInfo->rcWork.left,
+					monitorInfo->rcWork.top,
+					monitorInfo->rcWork.right,
+					monitorInfo->rcWork.bottom,
+					static_cast<unsigned long>(monitorInfo->dwFlags),
+					caller,
+					static_cast<unsigned long long>(callerRva),
+					static_cast<unsigned long>(GetCurrentThreadId()));
+			}
+		}
+		else
+		{
+			trace("[WineDisplayApi] api=GetMonitorInfoA monitor=%p cbSize=%lu result=%d lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+				static_cast<void*>(monitor),
+				static_cast<unsigned long>(inputSize),
+				result,
+				static_cast<unsigned long>(apiLastError),
+				caller,
+				static_cast<unsigned long long>(callerRva),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+		}
+	}
+
+	SetLastError(apiLastError);
+	return result;
+}
+
+static HMONITOR WINAPI TraceMonitorFromPoint(POINT point, DWORD flags)
+{
+	void* caller = _ReturnAddress();
+	const HMONITOR result = g_origMonitorFromPoint(point, flags);
+	const DWORD apiLastError = GetLastError();
+	uintptr_t callerRva;
+
+	if (GetDisplayTraceCaller(caller, &callerRva))
+	{
+		trace("[WineDisplayApi] api=MonitorFromPoint point=(%ld,%ld) flags=0x%08lx result=%p lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+			point.x,
+			point.y,
+			static_cast<unsigned long>(flags),
+			static_cast<void*>(result),
+			static_cast<unsigned long>(apiLastError),
+			caller,
+			static_cast<unsigned long long>(callerRva),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+	}
+
+	SetLastError(apiLastError);
+	return result;
+}
+
+static const char* GetSystemMetricName(int index)
+{
+	switch (index)
+	{
+		case SM_CXSCREEN: return "SM_CXSCREEN";
+		case SM_CYSCREEN: return "SM_CYSCREEN";
+		case SM_XVIRTUALSCREEN: return "SM_XVIRTUALSCREEN";
+		case SM_YVIRTUALSCREEN: return "SM_YVIRTUALSCREEN";
+		case SM_CXVIRTUALSCREEN: return "SM_CXVIRTUALSCREEN";
+		case SM_CYVIRTUALSCREEN: return "SM_CYVIRTUALSCREEN";
+		case SM_CMONITORS: return "SM_CMONITORS";
+		default: return nullptr;
+	}
+}
+
+static int WINAPI TraceGetSystemMetrics(int index)
+{
+	void* caller = _ReturnAddress();
+	const int result = g_origGetSystemMetrics(index);
+	const DWORD apiLastError = GetLastError();
+	const char* metricName = GetSystemMetricName(index);
+	uintptr_t callerRva;
+
+	if (metricName && GetDisplayTraceCaller(caller, &callerRva))
+	{
+		trace("[WineDisplayApi] api=GetSystemMetrics index=%d metric=%s result=%d lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+			index,
+			metricName,
+			result,
+			static_cast<unsigned long>(apiLastError),
+			caller,
+			static_cast<unsigned long long>(callerRva),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+	}
+
+	SetLastError(apiLastError);
+	return result;
+}
+
+static LONG WINAPI TraceQueryDisplayConfig(UINT32 flags, UINT32* numPathArrayElements, DISPLAYCONFIG_PATH_INFO* pathArray, UINT32* numModeInfoArrayElements, DISPLAYCONFIG_MODE_INFO* modeInfoArray, DISPLAYCONFIG_TOPOLOGY_ID* currentTopologyId)
+{
+	void* caller = _ReturnAddress();
+	const UINT32 pathCapacity = numPathArrayElements ? *numPathArrayElements : 0;
+	const UINT32 modeCapacity = numModeInfoArrayElements ? *numModeInfoArrayElements : 0;
+	const LONG result = g_origQueryDisplayConfig(flags, numPathArrayElements, pathArray, numModeInfoArrayElements, modeInfoArray, currentTopologyId);
+	const DWORD apiLastError = GetLastError();
+	uintptr_t callerRva;
+
+	if (GetDisplayTraceCaller(caller, &callerRva))
+	{
+		const UINT32 pathCount = numPathArrayElements ? *numPathArrayElements : 0;
+		const UINT32 modeCount = numModeInfoArrayElements ? *numModeInfoArrayElements : 0;
+		trace("[WineDisplayApi] api=QueryDisplayConfig flags=0x%08x pathCapacity=%u modeCapacity=%u result=%ld pathCount=%u modeCount=%u topology=%u lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+			flags,
+			pathCapacity,
+			modeCapacity,
+			result,
+			pathCount,
+			modeCount,
+			currentTopologyId ? static_cast<unsigned int>(*currentTopologyId) : 0,
+			static_cast<unsigned long>(apiLastError),
+			caller,
+			static_cast<unsigned long long>(callerRva),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+
+		if (result == ERROR_SUCCESS && pathArray && numPathArrayElements)
+		{
+			const UINT32 safePathCount = (pathCount < pathCapacity) ? pathCount : pathCapacity;
+			for (UINT32 i = 0; i < safePathCount; ++i)
+			{
+				const auto& path = pathArray[i];
+				trace("[WineDisplayApi] api=QueryDisplayConfigPath index=%u sourceAdapter=(%ld,0x%08lx) sourceId=%u sourceModeInfoIdx=%u sourceStatus=0x%08x targetAdapter=(%ld,0x%08lx) targetId=%u targetModeInfoIdx=%u outputTechnology=%u rotation=%u scaling=%u refresh=%u/%u scanLineOrdering=%u targetAvailable=%d targetStatus=0x%08x callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					i,
+					path.sourceInfo.adapterId.HighPart,
+					static_cast<unsigned long>(path.sourceInfo.adapterId.LowPart),
+					path.sourceInfo.id,
+					path.sourceInfo.modeInfoIdx,
+					path.sourceInfo.statusFlags,
+					path.targetInfo.adapterId.HighPart,
+					static_cast<unsigned long>(path.targetInfo.adapterId.LowPart),
+					path.targetInfo.id,
+					path.targetInfo.modeInfoIdx,
+					static_cast<unsigned int>(path.targetInfo.outputTechnology),
+					static_cast<unsigned int>(path.targetInfo.rotation),
+					static_cast<unsigned int>(path.targetInfo.scaling),
+					path.targetInfo.refreshRate.Numerator,
+					path.targetInfo.refreshRate.Denominator,
+					static_cast<unsigned int>(path.targetInfo.scanLineOrdering),
+					path.targetInfo.targetAvailable,
+					path.targetInfo.statusFlags,
+					caller,
+					static_cast<unsigned long long>(callerRva),
+					static_cast<unsigned long>(GetCurrentThreadId()));
+			}
+		}
+
+		if (result == ERROR_SUCCESS && modeInfoArray && numModeInfoArrayElements)
+		{
+			const UINT32 safeModeCount = (modeCount < modeCapacity) ? modeCount : modeCapacity;
+			for (UINT32 i = 0; i < safeModeCount; ++i)
+			{
+				const auto& mode = modeInfoArray[i];
+				if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+				{
+					trace("[WineDisplayApi] api=QueryDisplayConfigMode index=%u type=source adapter=(%ld,0x%08lx) id=%u width=%u height=%u pixelFormat=%u position=(%ld,%ld) callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+						i,
+						mode.adapterId.HighPart,
+						static_cast<unsigned long>(mode.adapterId.LowPart),
+						mode.id,
+						mode.sourceMode.width,
+						mode.sourceMode.height,
+						static_cast<unsigned int>(mode.sourceMode.pixelFormat),
+						mode.sourceMode.position.x,
+						mode.sourceMode.position.y,
+						caller,
+						static_cast<unsigned long long>(callerRva),
+						static_cast<unsigned long>(GetCurrentThreadId()));
+				}
+				else if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+				{
+					const auto& signal = mode.targetMode.targetVideoSignalInfo;
+					trace("[WineDisplayApi] api=QueryDisplayConfigMode index=%u type=target adapter=(%ld,0x%08lx) id=%u active=%ux%u total=%ux%u vSync=%u/%u hSync=%u/%u pixelRate=%llu scanLineOrdering=%u callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+						i,
+						mode.adapterId.HighPart,
+						static_cast<unsigned long>(mode.adapterId.LowPart),
+						mode.id,
+						signal.activeSize.cx,
+						signal.activeSize.cy,
+						signal.totalSize.cx,
+						signal.totalSize.cy,
+						signal.vSyncFreq.Numerator,
+						signal.vSyncFreq.Denominator,
+						signal.hSyncFreq.Numerator,
+						signal.hSyncFreq.Denominator,
+						static_cast<unsigned long long>(signal.pixelRate),
+						static_cast<unsigned int>(signal.scanLineOrdering),
+						caller,
+						static_cast<unsigned long long>(callerRva),
+						static_cast<unsigned long>(GetCurrentThreadId()));
+				}
+				else
+				{
+					trace("[WineDisplayApi] api=QueryDisplayConfigMode index=%u type=%u adapter=(%ld,0x%08lx) id=%u callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+						i,
+						static_cast<unsigned int>(mode.infoType),
+						mode.adapterId.HighPart,
+						static_cast<unsigned long>(mode.adapterId.LowPart),
+						mode.id,
+						caller,
+						static_cast<unsigned long long>(callerRva),
+						static_cast<unsigned long>(GetCurrentThreadId()));
+				}
+			}
+		}
+	}
+
+	SetLastError(apiLastError);
+	return result;
+}
+
+static LONG WINAPI TraceDisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_HEADER* requestPacket)
+{
+	void* caller = _ReturnAddress();
+	const DISPLAYCONFIG_DEVICE_INFO_TYPE type = requestPacket ? requestPacket->type : static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(0);
+	const UINT32 size = requestPacket ? requestPacket->size : 0;
+	const LUID adapterId = requestPacket ? requestPacket->adapterId : LUID{};
+	const UINT32 id = requestPacket ? requestPacket->id : 0;
+	const LONG result = g_origDisplayConfigGetDeviceInfo(requestPacket);
+	const DWORD apiLastError = GetLastError();
+	uintptr_t callerRva;
+
+	if (GetDisplayTraceCaller(caller, &callerRva))
+	{
+		trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfo type=%u size=%u adapter=(%ld,0x%08lx) id=%u result=%ld lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+			static_cast<unsigned int>(type),
+			size,
+			adapterId.HighPart,
+			static_cast<unsigned long>(adapterId.LowPart),
+			id,
+			result,
+			static_cast<unsigned long>(apiLastError),
+			caller,
+			static_cast<unsigned long long>(callerRva),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+
+		if (result == ERROR_SUCCESS && requestPacket)
+		{
+			if (type == DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME && size >= sizeof(DISPLAYCONFIG_SOURCE_DEVICE_NAME))
+			{
+				const auto packet = reinterpret_cast<const DISPLAYCONFIG_SOURCE_DEVICE_NAME*>(requestPacket);
+				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=source-name gdiDevice=%ls callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					packet->viewGdiDeviceName,
+					caller,
+					static_cast<unsigned long long>(callerRva),
+					static_cast<unsigned long>(GetCurrentThreadId()));
+			}
+			else if (type == DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME && size >= sizeof(DISPLAYCONFIG_TARGET_DEVICE_NAME))
+			{
+				const auto packet = reinterpret_cast<const DISPLAYCONFIG_TARGET_DEVICE_NAME*>(requestPacket);
+				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=target-name outputTechnology=%u edidManufactureId=%u edidProductCodeId=%u connectorInstance=%u friendlyName=%ls monitorPath=%ls callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					static_cast<unsigned int>(packet->outputTechnology),
+					packet->edidManufactureId,
+					packet->edidProductCodeId,
+					packet->connectorInstance,
+					packet->monitorFriendlyDeviceName,
+					packet->monitorDevicePath,
+					caller,
+					static_cast<unsigned long long>(callerRva),
+					static_cast<unsigned long>(GetCurrentThreadId()));
+			}
+			else if (type == DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE && size >= sizeof(DISPLAYCONFIG_TARGET_PREFERRED_MODE))
+			{
+				const auto packet = reinterpret_cast<const DISPLAYCONFIG_TARGET_PREFERRED_MODE*>(requestPacket);
+				const auto& signal = packet->targetMode.targetVideoSignalInfo;
+				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=target-preferred width=%u height=%u active=%ux%u total=%ux%u vSync=%u/%u hSync=%u/%u pixelRate=%llu scanLineOrdering=%u callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					packet->width,
+					packet->height,
+					signal.activeSize.cx,
+					signal.activeSize.cy,
+					signal.totalSize.cx,
+					signal.totalSize.cy,
+					signal.vSyncFreq.Numerator,
+					signal.vSyncFreq.Denominator,
+					signal.hSyncFreq.Numerator,
+					signal.hSyncFreq.Denominator,
+					static_cast<unsigned long long>(signal.pixelRate),
+					static_cast<unsigned int>(signal.scanLineOrdering),
+					caller,
+					static_cast<unsigned long long>(callerRva),
+					static_cast<unsigned long>(GetCurrentThreadId()));
+			}
+			else if (type == DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME && size >= sizeof(DISPLAYCONFIG_ADAPTER_NAME))
+			{
+				const auto packet = reinterpret_cast<const DISPLAYCONFIG_ADAPTER_NAME*>(requestPacket);
+				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=adapter-name path=%ls callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					packet->adapterDevicePath,
+					caller,
+					static_cast<unsigned long long>(callerRva),
+					static_cast<unsigned long>(GetCurrentThreadId()));
+			}
+		}
+	}
+
+	SetLastError(apiLastError);
+	return result;
+}
+
+static const char* GetDeviceCapName(int index)
+{
+	switch (index)
+	{
+		case HORZSIZE: return "HORZSIZE";
+		case VERTSIZE: return "VERTSIZE";
+		case HORZRES: return "HORZRES";
+		case VERTRES: return "VERTRES";
+		case LOGPIXELSX: return "LOGPIXELSX";
+		case LOGPIXELSY: return "LOGPIXELSY";
+		case VREFRESH: return "VREFRESH";
+		case DESKTOPHORZRES: return "DESKTOPHORZRES";
+		case DESKTOPVERTRES: return "DESKTOPVERTRES";
+		default: return nullptr;
+	}
+}
+
+static int WINAPI TraceGetDeviceCaps(HDC deviceContext, int index)
+{
+	void* caller = _ReturnAddress();
+	const int result = g_origGetDeviceCaps(deviceContext, index);
+	const DWORD apiLastError = GetLastError();
+	const char* capName = GetDeviceCapName(index);
+	uintptr_t callerRva;
+
+	if (capName && GetDisplayTraceCaller(caller, &callerRva))
+	{
+		trace("[WineDisplayApi] api=GetDeviceCaps hdc=%p index=%d cap=%s result=%d lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+			static_cast<void*>(deviceContext),
+			index,
+			capName,
+			result,
+			static_cast<unsigned long>(apiLastError),
+			caller,
+			static_cast<unsigned long long>(callerRva),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+	}
+
+	SetLastError(apiLastError);
+	return result;
+}
+
+static void InstallWineDisplayApiTrace()
+{
+	g_displayTraceGameBase = reinterpret_cast<uint8_t*>(hook::getRVA<void>(0));
+	const auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_displayTraceGameBase);
+	if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE)
+	{
+		const auto ntHeader = reinterpret_cast<const IMAGE_NT_HEADERS*>(g_displayTraceGameBase + dosHeader->e_lfanew);
+		if (ntHeader->Signature == IMAGE_NT_SIGNATURE)
+		{
+			g_displayTraceGameSize = ntHeader->OptionalHeader.SizeOfImage;
+		}
+	}
+
+	g_origEnumDisplaySettingsW = hook::iat("user32.dll", TraceEnumDisplaySettingsW, "EnumDisplaySettingsW");
+	g_origEnumDisplayDevicesA = hook::iat("user32.dll", TraceEnumDisplayDevicesA, "EnumDisplayDevicesA");
+	g_origGetMonitorInfoA = hook::iat("user32.dll", TraceGetMonitorInfoA, "GetMonitorInfoA");
+	g_origMonitorFromPoint = hook::iat("user32.dll", TraceMonitorFromPoint, "MonitorFromPoint");
+	g_origGetSystemMetrics = hook::iat("user32.dll", TraceGetSystemMetrics, "GetSystemMetrics");
+	g_origQueryDisplayConfig = hook::iat("user32.dll", TraceQueryDisplayConfig, "QueryDisplayConfig");
+	g_origDisplayConfigGetDeviceInfo = hook::iat("user32.dll", TraceDisplayConfigGetDeviceInfo, "DisplayConfigGetDeviceInfo");
+	g_origGetDeviceCaps = hook::iat("gdi32.dll", TraceGetDeviceCaps, "GetDeviceCaps");
+
+	const DWORD lastError = GetLastError();
+	trace("[WineDisplayApi] stage=installed gameBase=%p gameSize=0x%llx enumSettings=%d enumDevices=%d monitorInfo=%d monitorFromPoint=%d systemMetrics=%d queryConfig=%d deviceInfo=%d deviceCaps=%d callerFilter=game-main-range tid=%lu\n",
+		g_displayTraceGameBase,
+		static_cast<unsigned long long>(g_displayTraceGameSize),
+		g_origEnumDisplaySettingsW != nullptr,
+		g_origEnumDisplayDevicesA != nullptr,
+		g_origGetMonitorInfoA != nullptr,
+		g_origMonitorFromPoint != nullptr,
+		g_origGetSystemMetrics != nullptr,
+		g_origQueryDisplayConfig != nullptr,
+		g_origDisplayConfigGetDeviceInfo != nullptr,
+		g_origGetDeviceCaps != nullptr,
+		static_cast<unsigned long>(GetCurrentThreadId()));
+	SetLastError(lastError);
+}
+
+static void TraceWineResolutionSettings(const char* settings)
+{
+	const DWORD lastError = GetLastError();
+	trace("[WineResSettings] stage=post-parse width=%d height=%d window=%d vsync=%d isNew=%d tid=%lu\n",
+		*(const int*)(settings + 248),
+		*(const int*)(settings + 252),
+		*(const int*)(settings + 260),
+		*(const int*)(settings + 264),
+		isNewSettingFile,
+		static_cast<unsigned long>(GetCurrentThreadId()));
+	SetLastError(lastError);
+}
+
 static hook::cdecl_stub<bool(void*, void*)> _saveSettings([]()
 {
 	return hook::get_pattern("66 39 34 48 75 F7 8D 41 01 48 8B CE", -0x55);
@@ -73,6 +639,11 @@ static void LoadSettingsFromParams(char* settings)
 {
 	g_origLoadSettingsFromParams(settings);
 
+	if (CfxIsWine())
+	{
+		TraceWineResolutionSettings(settings);
+	}
+
 	if (isNewSettingFile)
 	{
 		SetDefaults(settings);
@@ -103,6 +674,11 @@ namespace WRL = Microsoft::WRL;
 
 static HookFunction hookFunction([]()
 {
+	if (CfxIsWine())
+	{
+		InstallWineDisplayApiTrace();
+	}
+
 	// settings.xml moving for new installs
 	if (IsNewInstall())
 	{
