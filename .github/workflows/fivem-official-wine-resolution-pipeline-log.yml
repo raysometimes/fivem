@@ -161,10 +161,13 @@ jobs:
           $drawSource = Get-Content $sourcePaths[1] -Raw
           $renderSource = Get-Content $sourcePaths[2] -Raw
 
-          foreach ($stage in @('post-parse', 'pre-defaults', 'post-defaults', 'set-defaults', 'reset-entry', 'reset-post-orig', 'reset-post-defaults')) {
+          foreach ($stage in @('post-parse', 'pre-defaults', 'post-defaults', 'reset-entry', 'reset-post-orig', 'reset-post-defaults')) {
             if (-not $vidSource.Contains('"' + $stage + '"')) {
               throw "Missing WineResSettings stage: $stage"
             }
+          }
+          if (-not $vidSource.Contains('stage=set-defaults')) {
+            throw "Missing WineResSettings stage: set-defaults"
           }
           foreach ($stage in @('seed', 'raw-change', 'cache-change', 'returned-diff')) {
             if (-not $drawSource.Contains('"' + $stage + '"')) {
