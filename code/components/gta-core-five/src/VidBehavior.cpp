@@ -84,6 +84,22 @@ static const char* GetDisplayModeName(DWORD modeNum)
 	return "INDEX";
 }
 
+template<size_t Size>
+static const char* GetDisplayTraceUtf8(LPCWSTR value, char (&buffer)[Size])
+{
+	if (!value)
+	{
+		return "<null>";
+	}
+
+	if (WideCharToMultiByte(CP_UTF8, 0, value, -1, buffer, static_cast<int>(Size), nullptr, nullptr) == 0)
+	{
+		return "<conversion-failed>";
+	}
+
+	return buffer;
+}
+
 static BOOL WINAPI TraceEnumDisplaySettingsW(LPCWSTR deviceName, DWORD modeNum, DEVMODEW* mode)
 {
 	void* caller = _ReturnAddress();
@@ -93,10 +109,13 @@ static BOOL WINAPI TraceEnumDisplaySettingsW(LPCWSTR deviceName, DWORD modeNum, 
 
 	if (GetDisplayTraceCaller(caller, &callerRva))
 	{
+		char deviceNameUtf8[512];
+		const char* traceDeviceName = GetDisplayTraceUtf8(deviceName, deviceNameUtf8);
+
 		if (result && mode)
 		{
-			trace("[WineDisplayApi] api=EnumDisplaySettingsW device=%ls mode=%s modeValue=0x%08lx result=%d width=%lu height=%lu orientation=%lu frequency=%lu fields=0x%08lx position=(%ld,%ld) bitsPerPel=%lu flags=0x%08lx callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
-				deviceName ? deviceName : L"<null>",
+			trace("[WineDisplayApi] api=EnumDisplaySettingsW device=%s mode=%s modeValue=0x%08lx result=%d width=%lu height=%lu orientation=%lu frequency=%lu fields=0x%08lx position=(%ld,%ld) bitsPerPel=%lu flags=0x%08lx callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+				traceDeviceName,
 				GetDisplayModeName(modeNum),
 				static_cast<unsigned long>(modeNum),
 				result,
@@ -115,8 +134,8 @@ static BOOL WINAPI TraceEnumDisplaySettingsW(LPCWSTR deviceName, DWORD modeNum, 
 		}
 		else
 		{
-			trace("[WineDisplayApi] api=EnumDisplaySettingsW device=%ls mode=%s modeValue=0x%08lx result=%d lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
-				deviceName ? deviceName : L"<null>",
+			trace("[WineDisplayApi] api=EnumDisplaySettingsW device=%s mode=%s modeValue=0x%08lx result=%d lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+				traceDeviceName,
 				GetDisplayModeName(modeNum),
 				static_cast<unsigned long>(modeNum),
 				result,
@@ -458,8 +477,9 @@ static LONG WINAPI TraceDisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_HEA
 			if (type == DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME && size >= sizeof(DISPLAYCONFIG_SOURCE_DEVICE_NAME))
 			{
 				const auto packet = reinterpret_cast<const DISPLAYCONFIG_SOURCE_DEVICE_NAME*>(requestPacket);
-				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=source-name gdiDevice=%ls callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
-					packet->viewGdiDeviceName,
+				char deviceNameUtf8[512];
+				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=source-name gdiDevice=%s callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					GetDisplayTraceUtf8(packet->viewGdiDeviceName, deviceNameUtf8),
 					caller,
 					static_cast<unsigned long long>(callerRva),
 					static_cast<unsigned long>(GetCurrentThreadId()));
@@ -467,13 +487,15 @@ static LONG WINAPI TraceDisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_HEA
 			else if (type == DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME && size >= sizeof(DISPLAYCONFIG_TARGET_DEVICE_NAME))
 			{
 				const auto packet = reinterpret_cast<const DISPLAYCONFIG_TARGET_DEVICE_NAME*>(requestPacket);
-				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=target-name outputTechnology=%u edidManufactureId=%u edidProductCodeId=%u connectorInstance=%u friendlyName=%ls monitorPath=%ls callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+				char friendlyNameUtf8[256];
+				char monitorPathUtf8[512];
+				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=target-name outputTechnology=%u edidManufactureId=%u edidProductCodeId=%u connectorInstance=%u friendlyName=%s monitorPath=%s callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
 					static_cast<unsigned int>(packet->outputTechnology),
 					packet->edidManufactureId,
 					packet->edidProductCodeId,
 					packet->connectorInstance,
-					packet->monitorFriendlyDeviceName,
-					packet->monitorDevicePath,
+					GetDisplayTraceUtf8(packet->monitorFriendlyDeviceName, friendlyNameUtf8),
+					GetDisplayTraceUtf8(packet->monitorDevicePath, monitorPathUtf8),
 					caller,
 					static_cast<unsigned long long>(callerRva),
 					static_cast<unsigned long>(GetCurrentThreadId()));
@@ -502,8 +524,9 @@ static LONG WINAPI TraceDisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_HEA
 			else if (type == DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME && size >= sizeof(DISPLAYCONFIG_ADAPTER_NAME))
 			{
 				const auto packet = reinterpret_cast<const DISPLAYCONFIG_ADAPTER_NAME*>(requestPacket);
-				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=adapter-name path=%ls callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
-					packet->adapterDevicePath,
+				char adapterPathUtf8[512];
+				trace("[WineDisplayApi] api=DisplayConfigGetDeviceInfoResult type=adapter-name path=%s callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
+					GetDisplayTraceUtf8(packet->adapterDevicePath, adapterPathUtf8),
 					caller,
 					static_cast<unsigned long long>(callerRva),
 					static_cast<unsigned long>(GetCurrentThreadId()));
