@@ -1,0 +1,452 @@
+name: FiveM official Wine Display Orientation Normalize
+
+on:
+  push:
+    branches:
+      - diagnostics/official-wine-display-orientation-normalize
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      SOURCE_ROOT: 'C:\b\five'
+      ARTIFACT_ROOT: 'C:\b\artifact'
+      WINDOWS_SDK_VERSION: '10.0.22621.0'
+      PINNED_UPSTREAM_COMMIT: '0d8a2a6f78a9922445d8930305af82a7b1826980'
+      EXPERIMENT_BASE_COMMIT: 'f71fb73baf79a324414636a048fc02c57b7d51f9'
+      EXPERIMENT_BASE_TREE: '32b319b494a1b92cc34229b7459126e451f6c65b'
+
+    steps:
+      - name: Checkout repository and pinned submodules at short path
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+          New-Item -ItemType Directory -Force C:\b | Out-Null
+          git init $env:SOURCE_ROOT
+          git -C $env:SOURCE_ROOT config core.symlinks true
+          git -C $env:SOURCE_ROOT remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git"
+          git -C $env:SOURCE_ROOT fetch --no-tags --depth=32 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository fetch failed."
+          }
+
+          git -C $env:SOURCE_ROOT checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository checkout failed."
+          }
+
+          git -C $env:SOURCE_ROOT merge-base --is-ancestor `
+            $env:PINNED_UPSTREAM_COMMIT `
+            $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned upstream commit $($env:PINNED_UPSTREAM_COMMIT) is not an ancestor of $($env:GITHUB_SHA)."
+          }
+
+          git -C $env:SOURCE_ROOT merge-base --is-ancestor `
+            $env:EXPERIMENT_BASE_COMMIT `
+            $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Known-good experiment base $($env:EXPERIMENT_BASE_COMMIT) is not an ancestor of $($env:GITHUB_SHA)."
+          }
+
+          $baseTree = (git -C $env:SOURCE_ROOT rev-parse "$($env:EXPERIMENT_BASE_COMMIT)^{tree}").Trim()
+          if ($baseTree -ne $env:EXPERIMENT_BASE_TREE) {
+            throw "Known-good base tree mismatch: expected $($env:EXPERIMENT_BASE_TREE), got $baseTree."
+          }
+
+          git -C $env:SOURCE_ROOT submodule sync --recursive
+          git -C $env:SOURCE_ROOT submodule update --init --recursive --depth=1 --jobs=4
+          if ($LASTEXITCODE -ne 0) {
+            throw "Submodule checkout failed."
+          }
+
+      - name: Audit experiment identity and orientation-only source delta
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          $headCommit = (git rev-parse HEAD).Trim()
+          $headTree = (git rev-parse 'HEAD^{tree}').Trim()
+          $baseTree = (git rev-parse "$($env:EXPERIMENT_BASE_COMMIT)^{tree}").Trim()
+
+          Write-Host "Branch: $($env:GITHUB_REF_NAME)"
+          Write-Host "HEAD SHA: $headCommit"
+          Write-Host "HEAD tree: $headTree"
+          Write-Host "Known-good base SHA: $($env:EXPERIMENT_BASE_COMMIT)"
+          Write-Host "Known-good base tree: $baseTree"
+          Write-Host "Pinned upstream SHA: $($env:PINNED_UPSTREAM_COMMIT)"
+
+          if ($headCommit -ne $env:GITHUB_SHA) {
+            throw "Checked-out HEAD $headCommit does not match GITHUB_SHA $($env:GITHUB_SHA)."
+          }
+          if ($baseTree -ne $env:EXPERIMENT_BASE_TREE) {
+            throw "Known-good source base does not have the required tree."
+          }
+
+          $workflowPath = '.github/workflows/fivem-official-wine-display-orientation-normalize.yml'
+          $sourcePath = 'code/components/gta-core-five/src/VidBehavior.cpp'
+          $allowedFiles = @($workflowPath, $sourcePath)
+          $changedFiles = @(git diff --name-only $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to enumerate the experiment delta."
+          }
+
+          Write-Host 'Files changed from the known-good source base:'
+          $changedFiles | ForEach-Object { Write-Host "  $_" }
+
+          $unexpectedFiles = @($changedFiles | Where-Object { $_ -notin $allowedFiles })
+          if ($unexpectedFiles.Count -ne 0) {
+            throw "Unexpected files differ from the known-good source base: $($unexpectedFiles -join ', ')"
+          }
+          foreach ($requiredFile in $allowedFiles) {
+            if ($requiredFile -notin $changedFiles) {
+              throw "Required experiment file is absent from the base delta: $requiredFile"
+            }
+          }
+
+          $nuiPath = Join-Path $env:SOURCE_ROOT 'code\components\nui-core\src\NUIWindow.cpp'
+          $nuiSource = Get-Content $nuiPath -Raw
+          $sharedAssignment = 'info.shared_texture_enabled = nuiSharedResourcesEnabled;'
+          $oldWineGuard = 'info.shared_texture_enabled = (!CfxIsWine() && nuiSharedResourcesEnabled);'
+          if ([regex]::Matches($nuiSource, [regex]::Escape($sharedAssignment)).Count -ne 1) {
+            throw "The proven NUI shared-texture assignment is missing or duplicated."
+          }
+          if ($nuiSource.Contains($oldWineGuard)) {
+            throw "The obsolete NUI Wine guard is present."
+          }
+          if ($nuiSource -match '\[WineGeometry\]|\[WineDisplay\]') {
+            throw "An earlier NUI geometry/display diagnostic was inherited."
+          }
+
+          $corePath = Join-Path $env:SOURCE_ROOT 'code\client\citicore\SEHTableHandler.Win32.cpp'
+          $coreSource = Get-Content $corePath -Raw
+          if (-not $coreSource.Contains('#include <LaunchMode.h>')) {
+            throw "The proven CoreRT Wine include is missing."
+          }
+          if (-not $coreSource.Contains('if (baseAddress && !CfxIsWine() && GetModuleHandle(L"xtajit64.dll") == nullptr)')) {
+            throw "The proven CoreRT Wine guard is missing."
+          }
+
+          $forbiddenFiles = @(
+            'code\client\shared\EarlyStartupTrace.h',
+            'code\client\shared\EarlyStartupRawTrace.h',
+            'code\tools\decode_early_startup_trace.py'
+          )
+          foreach ($file in $forbiddenFiles) {
+            if (Test-Path $file) {
+              throw "Unexpected early-startup instrumentation file: $file"
+            }
+          }
+
+          git -C vendor\minhook diff --quiet
+          if ($LASTEXITCODE -ne 0) {
+            throw "MinHook differs from its pinned submodule commit."
+          }
+          $minHookSource = Get-Content vendor\minhook\src\hook.c -Raw
+          if ($minHookSource -match 'CfxEarlyRawTrace|EarlyStartup|FreezeEnter') {
+            throw "Unexpected MinHook diagnostic instrumentation was inherited."
+          }
+
+          $vidSource = Get-Content $sourcePath -Raw
+          foreach ($requiredText in @(
+            '#include <LaunchMode.h>',
+            '[WineDisplayApi]',
+            '[WineOrientationFix] api=EnumDisplaySettingsW original=3 presented=0',
+            '[WineOrientationFix] api=QueryDisplayConfig path=%u original=4 presented=1',
+            '[WineResSettings] stage=post-parse',
+            'callerModule=game-main',
+            'GetDisplayTraceCaller(caller, &callerRva)',
+            'if (CfxIsWine() && isGameMainCaller && result && mode &&',
+            'if (CfxIsWine() && isGameMainCaller && result == ERROR_SUCCESS && pathArray &&',
+            'mode->dmDisplayOrientation = DMDO_DEFAULT;',
+            'path.targetInfo.rotation = DISPLAYCONFIG_ROTATION_IDENTITY;',
+            'SetLastError(apiLastError)',
+            'hook::iat("user32.dll", TraceEnumDisplaySettingsW, "EnumDisplaySettingsW")',
+            'hook::iat("user32.dll", TraceEnumDisplayDevicesA, "EnumDisplayDevicesA")',
+            'hook::iat("user32.dll", TraceGetMonitorInfoA, "GetMonitorInfoA")',
+            'hook::iat("user32.dll", TraceMonitorFromPoint, "MonitorFromPoint")',
+            'hook::iat("user32.dll", TraceGetSystemMetrics, "GetSystemMetrics")',
+            'hook::iat("user32.dll", TraceQueryDisplayConfig, "QueryDisplayConfig")',
+            'hook::iat("user32.dll", TraceDisplayConfigGetDeviceInfo, "DisplayConfigGetDeviceInfo")',
+            'hook::iat("gdi32.dll", TraceGetDeviceCaps, "GetDeviceCaps")'
+          )) {
+            if (-not $vidSource.Contains($requiredText)) {
+              throw "Required display API trace source is missing: $requiredText"
+            }
+          }
+
+          if ([regex]::Matches($vidSource, [regex]::Escape('if (CfxIsWine())')).Count -ne 2) {
+            throw "The trace is not limited to the two intended Wine-only entry points."
+          }
+
+          $sourceDiff = @(git diff --unified=0 $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA -- $sourcePath)
+          $addedSourceLines = @($sourceDiff | Where-Object { $_ -match '^\+[^+]' })
+
+          $orientationAssignments = @($addedSourceLines | Where-Object {
+            $_ -match '^\+\s*mode->dmDisplayOrientation\s*=\s*DMDO_DEFAULT;' -or
+            $_ -match '^\+\s*path\.targetInfo\.rotation\s*=\s*DISPLAYCONFIG_ROTATION_IDENTITY;'
+          })
+          if ($orientationAssignments.Count -ne 2) {
+            throw "Expected exactly the two approved orientation assignments; found $($orientationAssignments.Count)."
+          }
+
+          $forbiddenAddedLines = @($addedSourceLines | Where-Object {
+            ($_ -match 'dmDisplayOrientation\s*=(?!=)' -and $_ -notmatch 'dmDisplayOrientation\s*=\s*DMDO_DEFAULT;') -or
+            ($_ -match 'targetInfo\.rotation\s*=(?!=)' -and $_ -notmatch 'targetInfo\.rotation\s*=\s*DISPLAYCONFIG_ROTATION_IDENTITY;') -or
+            $_ -match 'dm(PelsWidth|PelsHeight|DisplayFrequency|Position|BitsPerPel|DisplayFlags|Fields)\s*=(?!=)' -or
+            $_ -match '(sourceMode\.(width|height)|activeSize\.(cx|cy))\s*=(?!=)' -or
+            $_ -match '(->|\.)(rcMonitor|rcWork)\s*=(?!=)' -or
+            $_ -match '\b(pathArray|modeInfoArray)\s*\[[^\]]+\]\s*=(?!=)' -or
+            $_ -match '(settings\s*\+\s*(248|252|260|264)).*\)\s*=(?!=)' -or
+            $_ -match '\b(CreateWindowExW|ChangeDisplaySettings|SetDisplayConfig|MoveWindow|SetWindowPos|ResizeBuffers)\s*\(' -or
+            $_ -match '\b(g_resolution|g_realResolution)\b'
+          })
+          if ($forbiddenAddedLines.Count -ne 0) {
+            throw "Orientation-only guard found a forbidden display mutation: $($forbiddenAddedLines -join ' | ')"
+          }
+
+          Write-Host 'Full experiment diff:'
+          git --no-pager diff --no-ext-diff --stat $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA
+          git --no-pager diff --no-ext-diff $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to print the experiment diff."
+          }
+
+      - name: Generate VS2022 projects
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 gen -game five
+          if ($LASTEXITCODE -ne 0) {
+            throw "FiveM project generation failed."
+          }
+
+          $oldTreeReferences = Get-ChildItem 'code\build\five' -Filter '*.vcxproj' -File |
+            Select-String -SimpleMatch 'C:\fivem-wine'
+          if ($oldTreeReferences) {
+            throw "Generated projects unexpectedly reference the old C:\fivem-wine tree."
+          }
+
+      - name: Audit gta-core-five project and dependency closure
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          $rootProject = Join-Path $env:SOURCE_ROOT 'code\build\five\gta-core-five.vcxproj'
+          if (-not (Test-Path $rootProject)) {
+            throw "Generated gta-core-five project was not found: $rootProject"
+          }
+
+          [xml]$rootProjectXml = Get-Content $rootProject -Raw
+          $projectDirectory = Split-Path $rootProject -Parent
+          $expectedSource = [System.IO.Path]::GetFullPath(
+            (Join-Path $env:SOURCE_ROOT 'code\components\gta-core-five\src\VidBehavior.cpp')
+          )
+          $compiledSources = @(
+            $rootProjectXml.SelectNodes("//*[local-name()='ClCompile']") |
+              ForEach-Object {
+                [System.IO.Path]::GetFullPath((Join-Path $projectDirectory $_.Include))
+              }
+          )
+          if (@($compiledSources | Where-Object { $_ -eq $expectedSource }).Count -ne 1) {
+            throw "VidBehavior.cpp is not compiled exactly once by $rootProject."
+          }
+
+          $releasePropertyGroup = @(
+            $rootProjectXml.SelectNodes("//*[local-name()='PropertyGroup']") |
+              Where-Object { $_.Condition -like '*Release|x64*' -and $_.OutDir }
+          )
+          if ($releasePropertyGroup.Count -ne 1) {
+            throw "Unable to identify one Release x64 output property group."
+          }
+
+          $resolvedOutDir = [System.IO.Path]::GetFullPath(
+            (Join-Path $projectDirectory ([string]$releasePropertyGroup[0].OutDir))
+          )
+          $targetName = [string]$releasePropertyGroup[0].TargetName
+          $targetExt = [string]$releasePropertyGroup[0].TargetExt
+          if ($targetName -ne 'gta-core-five' -or $targetExt -ne '.dll') {
+            throw "Unexpected gta-core-five target identity: $targetName$targetExt"
+          }
+          Write-Host "Exact output DLL: $(Join-Path $resolvedOutDir "$targetName$targetExt")"
+          Write-Host "Exact output PDB: $(Join-Path $resolvedOutDir "dbg\$targetName.pdb")"
+
+          $pending = [System.Collections.Generic.Stack[string]]::new()
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $pending.Push($rootProject)
+
+          while ($pending.Count -gt 0) {
+            $project = [System.IO.Path]::GetFullPath($pending.Pop())
+            if (-not $seen.Add($project)) {
+              continue
+            }
+
+            [xml]$projectXml = Get-Content $project -Raw
+            foreach ($reference in $projectXml.SelectNodes("//*[local-name()='ProjectReference']")) {
+              $include = [string]$reference.Include
+              if ($include -match '\$\(') {
+                throw "Unresolved project-reference path in ${project}: $include"
+              }
+              $referencedProject = [System.IO.Path]::GetFullPath(
+                (Join-Path (Split-Path $project -Parent) $include)
+              )
+              if (-not (Test-Path $referencedProject)) {
+                throw "Missing project reference: $referencedProject"
+              }
+              $pending.Push($referencedProject)
+            }
+          }
+
+          $closure = @($seen | Sort-Object)
+          $closure | ForEach-Object { Write-Host "gta-core-five dependency: $_" }
+
+          $forbiddenRuntimeProjects = @($closure | Where-Object {
+            [System.IO.Path]::GetFileName($_) -match '^(CitiLaunch|nui-core|glue)\.vcxproj$'
+          })
+          if ($forbiddenRuntimeProjects.Count -ne 0) {
+            throw "Unexpected launcher/NUI/glue project in dependency closure: $($forbiddenRuntimeProjects -join ', ')"
+          }
+
+          $coreProjects = @($closure | Where-Object {
+            [System.IO.Path]::GetFileName($_) -ieq 'CitiCore.vcxproj'
+          })
+          if ($coreProjects.Count -ne 1) {
+            throw "Expected exactly one CitiCore dependency because gta-core-five links CitiCore."
+          }
+          Write-Host 'CitiCore is an unavoidable project reference; CoreRT.dll is not packaged.'
+
+          $legitimacyProjects = @($closure | Where-Object {
+            [System.IO.Path]::GetFileName($_) -ieq 'legitimacy.vcxproj'
+          })
+          foreach ($legitimacyProject in $legitimacyProjects) {
+            [xml]$legitimacyXml = Get-Content $legitimacyProject -Raw
+            $configurationTypes = @(
+              $legitimacyXml.SelectNodes("//*[local-name()='ConfigurationType']") |
+                ForEach-Object { $_.'#text' } |
+                Sort-Object -Unique
+            )
+            if ($configurationTypes.Count -ne 1 -or $configurationTypes[0] -ne 'Utility') {
+              throw "legitimacy is not the expected bundled Utility dependency."
+            }
+            if (@($legitimacyXml.SelectNodes("//*[local-name()='ClCompile']")).Count -ne 0) {
+              throw "The bundled legitimacy project unexpectedly has compile items."
+            }
+            Write-Host 'legitimacy is a pinned prebuilt Utility dependency; it is not compiled or packaged.'
+          }
+
+      - name: Generate udis86 tables required by CitiCore
+        shell: cmd
+        working-directory: 'C:\b\five'
+        run: |
+          call code\prebuild_udis86.cmd
+          if errorlevel 1 exit /b 1
+          if not exist vendor\udis86\libudis86\itab.c exit /b 1
+          if not exist vendor\udis86\libudis86\itab.h exit /b 1
+
+      - name: Install CitiCore XPIDL Python dependencies
+        shell: pwsh
+        run: |
+          py -3 -m pip install "ply>=3.6,<4.0" six
+          if ($LASTEXITCODE -ne 0) {
+            throw "CitiCore XPIDL dependency installation failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Build gta-core-five Release x64
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = (& $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath).Trim()
+          if (-not $vsRoot) {
+            throw "Visual Studio 2022 with x64 C++ tools was not found."
+          }
+
+          $msbuild = Join-Path $vsRoot 'MSBuild\Current\Bin\MSBuild.exe'
+          $project = Join-Path $env:SOURCE_ROOT 'code\build\five\gta-core-five.vcxproj'
+
+          $env:UseMultiToolTask = 'true'
+          $env:EnforceProcessCountAcrossBuilds = 'true'
+
+          & $msbuild $project `
+            /t:Build `
+            /m:4 `
+            /nr:false `
+            /v:minimal `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PreferredToolArchitecture=x64 `
+            "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION" `
+            /p:BuildProjectReferences=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "gta-core-five build failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Stage and audit exact orientation-normalize artifact
+        shell: pwsh
+        run: |
+          $releaseRoot = Join-Path $env:SOURCE_ROOT 'code\bin\five\release'
+          $sourceFiles = [ordered]@{
+            'gta-core-five.dll' = (Join-Path $releaseRoot 'gta-core-five.dll')
+            'dbg/gta-core-five.pdb' = (Join-Path $releaseRoot 'dbg\gta-core-five.pdb')
+          }
+
+          foreach ($sourcePath in $sourceFiles.Values) {
+            if (-not (Test-Path $sourcePath -PathType Leaf)) {
+              throw "Expected targeted output was not produced: $sourcePath"
+            }
+          }
+
+          New-Item -ItemType Directory -Force $env:ARTIFACT_ROOT | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $env:ARTIFACT_ROOT 'dbg') | Out-Null
+          foreach ($entry in $sourceFiles.GetEnumerator()) {
+            $destination = Join-Path $env:ARTIFACT_ROOT ($entry.Key -replace '/', '\')
+            Copy-Item -LiteralPath $entry.Value -Destination $destination
+          }
+
+          $actualFiles = @(
+            Get-ChildItem $env:ARTIFACT_ROOT -Recurse -File |
+              ForEach-Object {
+                $_.FullName.Substring($env:ARTIFACT_ROOT.Length).TrimStart('\') -replace '\\', '/'
+              } |
+              Sort-Object
+          )
+          $expectedFiles = @($sourceFiles.Keys | Sort-Object)
+          if (($actualFiles -join "`n") -ne ($expectedFiles -join "`n")) {
+            throw "Artifact contents differ from the exact two-file allowlist. Actual: $($actualFiles -join ', ')"
+          }
+
+          Write-Host "Branch: $($env:GITHUB_REF_NAME)"
+          Write-Host "HEAD SHA: $($env:GITHUB_SHA)"
+          Write-Host "Known-good base SHA: $($env:EXPERIMENT_BASE_COMMIT)"
+          Write-Host "Known-good base tree: $($env:EXPERIMENT_BASE_TREE)"
+          Write-Host 'Exact artifact files and SHA256:'
+          foreach ($relativePath in $actualFiles) {
+            $fullPath = Join-Path $env:ARTIFACT_ROOT ($relativePath -replace '/', '\')
+            $hash = (Get-FileHash $fullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "ARTIFACT_FILE path=$relativePath sha256=$hash"
+          }
+
+      - name: Upload Wine display orientation normalize artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FiveM-official-wine-display-orientation-normalize
+          path: C:\b\artifact
+          if-no-files-found: error
+
+      - name: Report uploaded artifact identity
+        shell: pwsh
+        run: |
+          Write-Host "ARTIFACT_ID=${{ steps.upload.outputs.artifact-id }}"
+          Write-Host "ARTIFACT_URL=${{ steps.upload.outputs.artifact-url }}"
+          Write-Host "ARTIFACT_ZIP_SHA256=${{ steps.upload.outputs.artifact-digest }}"

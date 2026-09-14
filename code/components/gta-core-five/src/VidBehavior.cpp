@@ -106,8 +106,9 @@ static BOOL WINAPI TraceEnumDisplaySettingsW(LPCWSTR deviceName, DWORD modeNum, 
 	const BOOL result = g_origEnumDisplaySettingsW(deviceName, modeNum, mode);
 	const DWORD apiLastError = GetLastError();
 	uintptr_t callerRva;
+	const bool isGameMainCaller = GetDisplayTraceCaller(caller, &callerRva);
 
-	if (GetDisplayTraceCaller(caller, &callerRva))
+	if (isGameMainCaller)
 	{
 		char deviceNameUtf8[512];
 		const char* traceDeviceName = GetDisplayTraceUtf8(deviceName, deviceNameUtf8);
@@ -144,6 +145,17 @@ static BOOL WINAPI TraceEnumDisplaySettingsW(LPCWSTR deviceName, DWORD modeNum, 
 				static_cast<unsigned long long>(callerRva),
 				static_cast<unsigned long>(GetCurrentThreadId()));
 		}
+	}
+
+	if (CfxIsWine() && isGameMainCaller && result && mode &&
+		(mode->dmFields & DM_DISPLAYORIENTATION) && mode->dmDisplayOrientation == DMDO_270)
+	{
+		mode->dmDisplayOrientation = DMDO_DEFAULT;
+		trace("[WineOrientationFix] api=EnumDisplaySettingsW original=3 presented=0 width=%u height=%u callerRva=0x%llx tid=%lu\n",
+			static_cast<unsigned int>(mode->dmPelsWidth),
+			static_cast<unsigned int>(mode->dmPelsHeight),
+			static_cast<unsigned long long>(callerRva),
+			static_cast<unsigned long>(GetCurrentThreadId()));
 	}
 
 	SetLastError(apiLastError);
@@ -333,12 +345,13 @@ static LONG WINAPI TraceQueryDisplayConfig(UINT32 flags, UINT32* numPathArrayEle
 	const UINT32 modeCapacity = numModeInfoArrayElements ? *numModeInfoArrayElements : 0;
 	const LONG result = g_origQueryDisplayConfig(flags, numPathArrayElements, pathArray, numModeInfoArrayElements, modeInfoArray, currentTopologyId);
 	const DWORD apiLastError = GetLastError();
+	const UINT32 pathCount = numPathArrayElements ? *numPathArrayElements : 0;
+	const UINT32 modeCount = numModeInfoArrayElements ? *numModeInfoArrayElements : 0;
 	uintptr_t callerRva;
+	const bool isGameMainCaller = GetDisplayTraceCaller(caller, &callerRva);
 
-	if (GetDisplayTraceCaller(caller, &callerRva))
+	if (isGameMainCaller)
 	{
-		const UINT32 pathCount = numPathArrayElements ? *numPathArrayElements : 0;
-		const UINT32 modeCount = numModeInfoArrayElements ? *numModeInfoArrayElements : 0;
 		trace("[WineDisplayApi] api=QueryDisplayConfig flags=0x%08x pathCapacity=%u modeCapacity=%u result=%ld pathCount=%u modeCount=%u topology=%u lastError=%lu callerModule=game-main caller=%p callerRva=0x%llx tid=%lu\n",
 			flags,
 			pathCapacity,
@@ -439,6 +452,55 @@ static LONG WINAPI TraceQueryDisplayConfig(UINT32 flags, UINT32* numPathArrayEle
 						static_cast<unsigned long long>(callerRva),
 						static_cast<unsigned long>(GetCurrentThreadId()));
 				}
+			}
+		}
+	}
+
+	if (CfxIsWine() && isGameMainCaller && result == ERROR_SUCCESS && pathArray &&
+		numPathArrayElements && pathCount <= pathCapacity)
+	{
+		for (UINT32 i = 0; i < pathCount; ++i)
+		{
+			auto& path = pathArray[i];
+			if (path.targetInfo.rotation == DISPLAYCONFIG_ROTATION_ROTATE270)
+			{
+				UINT32 sourceWidth = 0;
+				UINT32 sourceHeight = 0;
+				UINT32 targetWidth = 0;
+				UINT32 targetHeight = 0;
+
+				if (modeInfoArray && numModeInfoArrayElements && modeCount <= modeCapacity)
+				{
+					if (path.sourceInfo.modeInfoIdx < modeCount)
+					{
+						const auto& sourceMode = modeInfoArray[path.sourceInfo.modeInfoIdx];
+						if (sourceMode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+						{
+							sourceWidth = sourceMode.sourceMode.width;
+							sourceHeight = sourceMode.sourceMode.height;
+						}
+					}
+
+					if (path.targetInfo.modeInfoIdx < modeCount)
+					{
+						const auto& targetMode = modeInfoArray[path.targetInfo.modeInfoIdx];
+						if (targetMode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+						{
+							targetWidth = targetMode.targetMode.targetVideoSignalInfo.activeSize.cx;
+							targetHeight = targetMode.targetMode.targetVideoSignalInfo.activeSize.cy;
+						}
+					}
+				}
+
+				path.targetInfo.rotation = DISPLAYCONFIG_ROTATION_IDENTITY;
+				trace("[WineOrientationFix] api=QueryDisplayConfig path=%u original=4 presented=1 source=%ux%u target=%ux%u callerRva=0x%llx tid=%lu\n",
+					i,
+					sourceWidth,
+					sourceHeight,
+					targetWidth,
+					targetHeight,
+					static_cast<unsigned long long>(callerRva),
+					static_cast<unsigned long>(GetCurrentThreadId()));
 			}
 		}
 	}
