@@ -42,6 +42,33 @@ static bool IsNewInstall()
 
 static bool isNewSettingFile;
 
+static void TraceWineResolutionSettings(const char* stage, const char* settings)
+{
+	const DWORD lastError = GetLastError();
+
+	if (settings)
+	{
+		trace("[WineResSettings] stage=%s ptr=%p width=%d height=%d window=%d vsync=%d isNew=%d tid=%lu\n",
+			stage,
+			static_cast<const void*>(settings),
+			*(const int*)(settings + 248),
+			*(const int*)(settings + 252),
+			*(const int*)(settings + 260),
+			*(const int*)(settings + 264),
+			isNewSettingFile,
+			GetCurrentThreadId());
+	}
+	else
+	{
+		trace("[WineResSettings] stage=%s ptr=null isNew=%d tid=%lu\n",
+			stage,
+			isNewSettingFile,
+			GetCurrentThreadId());
+	}
+
+	SetLastError(lastError);
+}
+
 static hook::cdecl_stub<bool(void*, void*)> _saveSettings([]()
 {
 	return hook::get_pattern("66 39 34 48 75 F7 8D 41 01 48 8B CE", -0x55);
@@ -61,10 +88,29 @@ static void SetDefaults(char* settings)
 
 	MONITORINFO mi;
 	mi.cbSize = sizeof(mi);
-	GetMonitorInfoW(monitor, &mi);
+	const BOOL monitorInfoSuccess = GetMonitorInfoW(monitor, &mi);
+	const DWORD monitorInfoLastError = GetLastError();
 
 	*(int*)(settings + 248) = mi.rcMonitor.right - mi.rcMonitor.left;
 	*(int*)(settings + 252) = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+	const DWORD lastError = GetLastError();
+	trace("[WineResSettings] stage=set-defaults ptr=%p monitor=%p monitorInfo=%d monitorError=%lu rect=(%ld,%ld,%ld,%ld) width=%d height=%d window=%d vsync=%d isNew=%d tid=%lu\n",
+		static_cast<void*>(settings),
+		static_cast<void*>(monitor),
+		monitorInfoSuccess,
+		monitorInfoLastError,
+		mi.rcMonitor.left,
+		mi.rcMonitor.top,
+		mi.rcMonitor.right,
+		mi.rcMonitor.bottom,
+		*(const int*)(settings + 248),
+		*(const int*)(settings + 252),
+		*(const int*)(settings + 260),
+		*(const int*)(settings + 264),
+		isNewSettingFile,
+		GetCurrentThreadId());
+	SetLastError(lastError);
 }
 
 static void (*g_origLoadSettingsFromParams)(void*);
@@ -72,10 +118,13 @@ static void (*g_origLoadSettingsFromParams)(void*);
 static void LoadSettingsFromParams(char* settings)
 {
 	g_origLoadSettingsFromParams(settings);
+	TraceWineResolutionSettings("post-parse", settings);
 
 	if (isNewSettingFile)
 	{
+		TraceWineResolutionSettings("pre-defaults", settings);
 		SetDefaults(settings);
+		TraceWineResolutionSettings("post-defaults", settings);
 
 		_saveSettings(settings, settings + 8);
 	}
@@ -85,9 +134,12 @@ static void (*g_origResetSettings)(void*);
 
 static void ResetSettings(char* settings)
 {
+	TraceWineResolutionSettings("reset-entry", settings);
 	g_origResetSettings(settings);
+	TraceWineResolutionSettings("reset-post-orig", settings);
 
 	SetDefaults(settings);
+	TraceWineResolutionSettings("reset-post-defaults", settings);
 }
 
 extern DLL_IMPORT fwEvent<bool*> OnFlipModelHook;

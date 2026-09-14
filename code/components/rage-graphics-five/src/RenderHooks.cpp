@@ -598,6 +598,77 @@ static void GoGetAdapter(IDXGIAdapter** ppAdapter)
 	}
 }
 
+static std::atomic<bool> g_hasLoggedSwapchainRequest(false);
+static std::atomic<uint64_t> g_lastLoggedSwapchainRequest(0);
+
+static uint64_t MixWineSwapchainRequestValue(uint64_t hash, uint64_t value)
+{
+	return (hash ^ value) * 1099511628211ULL;
+}
+
+static uint64_t GetWineSwapchainRequestSignature(const DXGI_SWAP_CHAIN_DESC& desc)
+{
+	uint64_t hash = 1469598103934665603ULL;
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferDesc.Width);
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferDesc.Height);
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferDesc.RefreshRate.Numerator);
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferDesc.RefreshRate.Denominator);
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferDesc.Format);
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferDesc.ScanlineOrdering);
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferDesc.Scaling);
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferCount);
+	hash = MixWineSwapchainRequestValue(hash, desc.BufferUsage);
+	hash = MixWineSwapchainRequestValue(hash, reinterpret_cast<uintptr_t>(desc.OutputWindow));
+	hash = MixWineSwapchainRequestValue(hash, desc.Windowed);
+	hash = MixWineSwapchainRequestValue(hash, desc.SwapEffect);
+	hash = MixWineSwapchainRequestValue(hash, desc.Flags);
+	return hash;
+}
+
+static void TraceWineSwapchainRequest(const char* stage, const DXGI_SWAP_CHAIN_DESC* desc)
+{
+	const DWORD lastError = GetLastError();
+
+	if (desc)
+	{
+		trace("[WineSwapchainRequest] stage=%s ptr=%p width=%u height=%u refresh=%u/%u format=%u scaling=%u scanline=%u bufferCount=%u bufferUsage=0x%08X hwnd=%p windowed=%d swapEffect=%u flags=0x%08X tid=%lu\n",
+			stage,
+			static_cast<const void*>(desc),
+			desc->BufferDesc.Width,
+			desc->BufferDesc.Height,
+			desc->BufferDesc.RefreshRate.Numerator,
+			desc->BufferDesc.RefreshRate.Denominator,
+			static_cast<unsigned int>(desc->BufferDesc.Format),
+			static_cast<unsigned int>(desc->BufferDesc.Scaling),
+			static_cast<unsigned int>(desc->BufferDesc.ScanlineOrdering),
+			desc->BufferCount,
+			desc->BufferUsage,
+			static_cast<void*>(desc->OutputWindow),
+			desc->Windowed,
+			static_cast<unsigned int>(desc->SwapEffect),
+			desc->Flags,
+			GetCurrentThreadId());
+	}
+	else
+	{
+		trace("[WineSwapchainRequest] stage=%s ptr=null tid=%lu\n", stage, GetCurrentThreadId());
+	}
+
+	SetLastError(lastError);
+}
+
+static void TraceWineSwapchainRequestIfNeeded(const DXGI_SWAP_CHAIN_DESC* desc)
+{
+	const bool isFirstRequest = !g_hasLoggedSwapchainRequest.exchange(true, std::memory_order_relaxed);
+	const uint64_t signature = desc ? GetWineSwapchainRequestSignature(*desc) : 0;
+	const uint64_t previousSignature = g_lastLoggedSwapchainRequest.exchange(signature, std::memory_order_relaxed);
+
+	if (isFirstRequest || previousSignature != signature)
+	{
+		TraceWineSwapchainRequest(isFirstRequest ? "first" : "change", desc);
+	}
+}
+
 static HRESULT CreateD3D11DeviceWrapOrig(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _In_opt_ CONST DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, _Out_opt_ IDXGISwapChain** ppSwapChain, _Out_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _Out_opt_ ID3D11DeviceContext** ppImmediateContext)
 {
 	GoGetAdapter(&pAdapter);
@@ -724,6 +795,8 @@ static HRESULT CreateD3D11DeviceWrapOrig(_In_opt_ IDXGIAdapter* pAdapter, D3D_DR
 
 static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _In_opt_ CONST DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, _Out_opt_ IDXGISwapChain** ppSwapChain, _Out_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _Out_opt_ ID3D11DeviceContext** ppImmediateContext)
 {
+	TraceWineSwapchainRequestIfNeeded(pSwapChainDesc);
+
 	HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 	HRESULT hresult = E_FAIL;
 
@@ -748,6 +821,30 @@ struct VideoModeInfo
 	int refreshRateDenominator;
 	bool fullscreen;
 };
+
+static void TraceWineVideoMode(const char* stage, const VideoModeInfo* info)
+{
+	const DWORD lastError = GetLastError();
+
+	if (info)
+	{
+		trace("[WineVideoMode] stage=%s ptr=%p width=%d height=%d refresh=%d/%d fullscreen=%d tid=%lu\n",
+			stage,
+			static_cast<const void*>(info),
+			info->width,
+			info->height,
+			info->refreshRateNumerator,
+			info->refreshRateDenominator,
+			info->fullscreen,
+			GetCurrentThreadId());
+	}
+	else
+	{
+		trace("[WineVideoMode] stage=%s ptr=null tid=%lu\n", stage, GetCurrentThreadId());
+	}
+
+	SetLastError(lastError);
+}
 
 static bool(*g_origVideoModeChange)(VideoModeInfo* info);
 
@@ -788,6 +885,7 @@ void WrapCreateBackbuffer(void* tf)
 
 bool WrapVideoModeChange(VideoModeInfo* info)
 {
+	TraceWineVideoMode("entry", info);
 	trace("Changing video mode.\n");
 
 	for (auto& res : g_resources)
@@ -803,6 +901,7 @@ bool WrapVideoModeChange(VideoModeInfo* info)
 	g_resources = {};
 
 	bool success = g_origVideoModeChange(info);
+	TraceWineVideoMode("exit", info);
 
 	trace("Changing video mode success: %d.\n", success);
 
@@ -1752,10 +1851,32 @@ void GfxForceVsync(bool enabled)
 static HWND g_gtaWindow;
 static decltype(&CreateWindowExW) g_origCreateWindowExW;
 
+static void TraceWineWindowRequest(DWORD dwExStyle, DWORD dwStyle, int x, int y, int width, int height, HWND parent)
+{
+	const DWORD lastError = GetLastError();
+
+	trace("[WineWindowRequest] class=grcWindow x=%d y=%d width=%d height=%d style=0x%08lX exStyle=0x%08lX parent=%p tid=%lu\n",
+		x,
+		y,
+		width,
+		height,
+		dwStyle,
+		dwExStyle,
+		static_cast<void*>(parent),
+		GetCurrentThreadId());
+
+	SetLastError(lastError);
+}
+
 static HWND WINAPI HookCreateWindowExW(_In_ DWORD dwExStyle, _In_opt_ LPCWSTR lpClassName, _In_opt_ LPCWSTR lpWindowName, _In_ DWORD dwStyle, _In_ int X, _In_ int Y, _In_ int nWidth, _In_ int nHeight, _In_opt_ HWND hWndParent, _In_opt_ HMENU hMenu, _In_opt_ HINSTANCE hInstance, _In_opt_ LPVOID lpParam)
 {
 	static HostSharedData<CfxState> initState("CfxInitState");
 	HWND w;
+
+	if (lpClassName && wcscmp(lpClassName, L"grcWindow") == 0)
+	{
+		TraceWineWindowRequest(dwExStyle, dwStyle, X, Y, nWidth, nHeight, hWndParent);
+	}
 
 	const auto wndName = L"FiveM® by Cfx.re";
 

@@ -304,6 +304,34 @@ void DrawImSprite(float x1, float y1, float x2, float y2, float z, float u1, flo
 static uint32_t* g_resolution;
 static uint32_t g_realResolution[2];
 
+static std::atomic<uint64_t> g_lastLoggedRawResolution(~uint64_t(0));
+static std::atomic<uint64_t> g_lastLoggedCachedResolution(~uint64_t(0));
+static std::atomic<uint64_t> g_lastLoggedMismatchRawResolution(~uint64_t(0));
+static std::atomic<uint64_t> g_lastLoggedMismatchReturnedResolution(~uint64_t(0));
+
+static uint64_t PackWineResolution(uint32_t width, uint32_t height)
+{
+	return (uint64_t(width) << 32) | uint64_t(height);
+}
+
+static void TraceWineRawResolution(const char* stage, uint32_t rawWidth, uint32_t rawHeight, uint32_t cachedWidth, uint32_t cachedHeight, uint32_t returnedWidth, uint32_t returnedHeight, bool isRenderThread)
+{
+	const DWORD lastError = GetLastError();
+
+	trace("[WineRawResolution] stage=%s raw=%ux%u cache=%ux%u returned=%ux%u tid=%lu renderThread=%d\n",
+		stage,
+		rawWidth,
+		rawHeight,
+		cachedWidth,
+		cachedHeight,
+		returnedWidth,
+		returnedHeight,
+		GetCurrentThreadId(),
+		isRenderThread);
+
+	SetLastError(lastError);
+}
+
 void GetGameResolution(int& resX, int& resY)
 {
 	if (!g_resolution)
@@ -315,6 +343,8 @@ void GetGameResolution(int& resX, int& resY)
 
 	resX = g_resolution[0];
 	resY = g_resolution[1];
+	const uint32_t rawWidth = resX;
+	const uint32_t rawHeight = resY;
 
 	if (IsOnRenderThread() && (resX != resY))
 	{
@@ -325,6 +355,41 @@ void GetGameResolution(int& resX, int& resY)
 	{
 		resX = g_realResolution[0];
 		resY = g_realResolution[1];
+	}
+
+	const uint32_t cachedWidth = g_realResolution[0];
+	const uint32_t cachedHeight = g_realResolution[1];
+	const uint32_t returnedWidth = resX;
+	const uint32_t returnedHeight = resY;
+	const bool isRenderThread = IsOnRenderThread();
+	const uint64_t rawResolution = PackWineResolution(rawWidth, rawHeight);
+	const uint64_t cachedResolution = PackWineResolution(cachedWidth, cachedHeight);
+	const uint64_t returnedResolution = PackWineResolution(returnedWidth, returnedHeight);
+
+	if (g_lastLoggedRawResolution.exchange(rawResolution, std::memory_order_relaxed) != rawResolution)
+	{
+		TraceWineRawResolution("raw-change", rawWidth, rawHeight, cachedWidth, cachedHeight, returnedWidth, returnedHeight, isRenderThread);
+	}
+
+	if (g_lastLoggedCachedResolution.exchange(cachedResolution, std::memory_order_relaxed) != cachedResolution)
+	{
+		TraceWineRawResolution("cache-change", rawWidth, rawHeight, cachedWidth, cachedHeight, returnedWidth, returnedHeight, isRenderThread);
+	}
+
+	if (returnedResolution != rawResolution)
+	{
+		const uint64_t previousRaw = g_lastLoggedMismatchRawResolution.exchange(rawResolution, std::memory_order_relaxed);
+		const uint64_t previousReturned = g_lastLoggedMismatchReturnedResolution.exchange(returnedResolution, std::memory_order_relaxed);
+
+		if (previousRaw != rawResolution || previousReturned != returnedResolution)
+		{
+			TraceWineRawResolution("returned-diff", rawWidth, rawHeight, cachedWidth, cachedHeight, returnedWidth, returnedHeight, isRenderThread);
+		}
+	}
+	else
+	{
+		g_lastLoggedMismatchRawResolution.store(~uint64_t(0), std::memory_order_relaxed);
+		g_lastLoggedMismatchReturnedResolution.store(~uint64_t(0), std::memory_order_relaxed);
 	}
 }
 
@@ -717,6 +782,17 @@ static HookFunction hookFunction([] ()
 	{
 		g_realResolution[0] = g_resolution[0];
 		g_realResolution[1] = g_resolution[1];
+
+		const uint32_t rawWidth = g_resolution[0];
+		const uint32_t rawHeight = g_resolution[1];
+
+		const uint64_t resolution = PackWineResolution(rawWidth, rawHeight);
+		g_lastLoggedRawResolution.store(resolution, std::memory_order_relaxed);
+		g_lastLoggedCachedResolution.store(resolution, std::memory_order_relaxed);
+		g_lastLoggedMismatchRawResolution.store(~uint64_t(0), std::memory_order_relaxed);
+		g_lastLoggedMismatchReturnedResolution.store(~uint64_t(0), std::memory_order_relaxed);
+
+		TraceWineRawResolution("seed", rawWidth, rawHeight, rawWidth, rawHeight, rawWidth, rawHeight, IsOnRenderThread());
 	}, -500);
 
 	// set immediate mode vertex limit to 8x what it was (so, 32 MB)
