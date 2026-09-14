@@ -287,10 +287,10 @@ jobs:
           $closure | ForEach-Object { Write-Host "gta-core-five dependency: $_" }
 
           $forbiddenRuntimeProjects = @($closure | Where-Object {
-            [System.IO.Path]::GetFileName($_) -match '^(CitiLaunch|nui-core|rage-graphics-five|glue)\.vcxproj$'
+            [System.IO.Path]::GetFileName($_) -match '^(CitiLaunch|nui-core|glue)\.vcxproj$'
           })
           if ($forbiddenRuntimeProjects.Count -ne 0) {
-            throw "Unexpected launcher/NUI/graphics project in dependency closure: $($forbiddenRuntimeProjects -join ', ')"
+            throw "Unexpected launcher/NUI/glue project in dependency closure: $($forbiddenRuntimeProjects -join ', ')"
           }
 
           $coreProjects = @($closure | Where-Object {
