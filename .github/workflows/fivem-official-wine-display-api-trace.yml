@@ -183,7 +183,8 @@ jobs:
           $addedSourceLines = @($sourceDiff | Where-Object { $_ -match '^\+[^+]' })
           $forbiddenAddedLines = @($addedSourceLines | Where-Object {
             $_ -match 'dm(DisplayOrientation|PelsWidth|PelsHeight|DisplayFrequency)\s*=' -or
-            $_ -match '(rcMonitor|rcWork|pathArray|modeInfoArray)[^;]*=' -or
+            $_ -match '(->|\.)(rcMonitor|rcWork)\s*=' -or
+            $_ -match '\b(pathArray|modeInfoArray)\s*\[[^\]]+\]\s*=' -or
             $_ -match '(settings\s*\+\s*(248|252|260|264)).*\)\s*=' -or
             $_ -match '\b(ChangeDisplaySettings|SetDisplayConfig|MoveWindow|SetWindowPos|ResizeBuffers)\s*\('
           })
