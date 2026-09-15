@@ -1,0 +1,587 @@
+name: FiveM official Wine Steam Deck Compatibility Release
+
+on:
+  push:
+    branches:
+      - release/official-wine-steamdeck-compat
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    env:
+      SOURCE_ROOT: 'C:\b\five'
+      ARTIFACT_ROOT: 'C:\b\artifact'
+      WINDOWS_SDK_VERSION: '10.0.22621.0'
+      PINNED_UPSTREAM_COMMIT: '0d8a2a6f78a9922445d8930305af82a7b1826980'
+      RELEASE_BASE_COMMIT: '7fe312211103bf78b5f8bbfc3ad107af421aeb36'
+      RELEASE_BASE_TREE: '87c0e6586d7e0d1c48911ace347f521815c29547'
+      ORIENTATION_BASE_COMMIT: 'f6740b955b213565486a9060b53f1ea6ddae3e45'
+      ORIENTATION_BASE_TREE: '2a2525816329b0620777d887072b40c76cae7bef'
+
+    steps:
+      - name: Checkout exact release source and pinned submodules at short path
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+          New-Item -ItemType Directory -Force C:\b | Out-Null
+          git init $env:SOURCE_ROOT
+          git -C $env:SOURCE_ROOT config core.symlinks true
+          git -C $env:SOURCE_ROOT remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git"
+          git -C $env:SOURCE_ROOT fetch --no-tags --depth=32 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository fetch failed."
+          }
+
+          git -C $env:SOURCE_ROOT checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Root repository checkout failed."
+          }
+
+          foreach ($ancestor in @(
+            $env:PINNED_UPSTREAM_COMMIT,
+            $env:ORIENTATION_BASE_COMMIT,
+            $env:RELEASE_BASE_COMMIT
+          )) {
+            git -C $env:SOURCE_ROOT merge-base --is-ancestor $ancestor $env:GITHUB_SHA
+            if ($LASTEXITCODE -ne 0) {
+              throw "Required commit $ancestor is not an ancestor of $($env:GITHUB_SHA)."
+            }
+          }
+
+          $releaseBaseTree = (git -C $env:SOURCE_ROOT rev-parse "$($env:RELEASE_BASE_COMMIT)^{tree}").Trim()
+          if ($releaseBaseTree -ne $env:RELEASE_BASE_TREE) {
+            throw "Release base tree mismatch: expected $($env:RELEASE_BASE_TREE), got $releaseBaseTree."
+          }
+
+          $orientationBaseTree = (git -C $env:SOURCE_ROOT rev-parse "$($env:ORIENTATION_BASE_COMMIT)^{tree}").Trim()
+          if ($orientationBaseTree -ne $env:ORIENTATION_BASE_TREE) {
+            throw "Orientation base tree mismatch: expected $($env:ORIENTATION_BASE_TREE), got $orientationBaseTree."
+          }
+
+          git -C $env:SOURCE_ROOT submodule sync --recursive
+          git -C $env:SOURCE_ROOT submodule update --init --recursive --depth=1 --jobs=4
+          if ($LASTEXITCODE -ne 0) {
+            throw "Submodule checkout failed."
+          }
+
+      - name: Audit exact release source identity and compatibility behavior
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          $workflowPath = '.github/workflows/fivem-official-wine-steamdeck-compat-release.yml'
+          $headCommit = (git rev-parse HEAD).Trim()
+          $headTree = (git rev-parse 'HEAD^{tree}').Trim()
+          $parentCommit = (git rev-parse "$($env:GITHUB_SHA)^").Trim()
+          $parentTree = (git rev-parse "$($env:RELEASE_BASE_COMMIT)^{tree}").Trim()
+
+          Write-Host "Release branch: $($env:GITHUB_REF_NAME)"
+          Write-Host "Release HEAD: $headCommit"
+          Write-Host "Release tree: $headTree"
+          Write-Host "Direct parent: $parentCommit"
+          Write-Host "Parent tree: $parentTree"
+          Write-Host "Pinned upstream: $($env:PINNED_UPSTREAM_COMMIT)"
+
+          if ($headCommit -ne $env:GITHUB_SHA) {
+            throw "Checked-out HEAD $headCommit does not match GITHUB_SHA $($env:GITHUB_SHA)."
+          }
+          if ($parentCommit -ne $env:RELEASE_BASE_COMMIT) {
+            throw "Release commit is not based directly on $($env:RELEASE_BASE_COMMIT)."
+          }
+          if ($parentTree -ne $env:RELEASE_BASE_TREE) {
+            throw "Direct parent does not have the proven source tree."
+          }
+
+          $changedFiles = @(git diff --name-only $env:RELEASE_BASE_COMMIT $env:GITHUB_SHA)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to enumerate the release delta."
+          }
+          Write-Host 'Files changed from the proven source HEAD:'
+          $changedFiles | ForEach-Object { Write-Host "  $_" }
+          if ($changedFiles.Count -ne 1 -or $changedFiles[0] -ne $workflowPath) {
+            throw "The release delta is not exactly the new workflow: $($changedFiles -join ', ')"
+          }
+
+          $cppDelta = @(git diff --name-only $env:RELEASE_BASE_COMMIT $env:GITHUB_SHA -- '*.cpp' '*.cc' '*.c' '*.h' '*.hpp')
+          if ($cppDelta.Count -ne 0) {
+            throw "C/C++ source differs from the proven release base: $($cppDelta -join ', ')"
+          }
+
+          foreach ($launcherPath in @(
+            'code/client/launcher/Console.Logging.cpp',
+            'code/client/launcher/Main.cpp'
+          )) {
+            git diff --quiet $env:RELEASE_BASE_COMMIT $env:GITHUB_SHA -- $launcherPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "Proven launcher/logging source changed: $launcherPath"
+            }
+          }
+
+          $sehPath = 'code/client/citicore/SEHTableHandler.Win32.cpp'
+          $sehSource = Get-Content $sehPath -Raw
+          $sehGuard = 'if (baseAddress && !CfxIsWine() && GetModuleHandle(L"xtajit64.dll") == nullptr)'
+          if ([regex]::Matches($sehSource, [regex]::Escape($sehGuard)).Count -ne 1) {
+            throw "The CoreRT Wine SEH guard is missing or duplicated."
+          }
+
+          $componentPath = 'code/client/citicore/ComponentLoader.cpp'
+          $componentSource = Get-Content $componentPath -Raw
+          $warningMarker = '[WineInsecureMode] insecure mode active; adhesive unsupported; sticky fallback enabled'
+          foreach ($requiredText in @(
+            'if (CfxIsWine() || GetModuleHandleW(L"xtajit64.dll") != nullptr)',
+            'auto cfxState = CfxState::Get();',
+            'if (cfxState->IsMasterProcess())',
+            'if (CfxIsWine())',
+            $warningMarker,
+            'L"Windows on ARM"',
+            'L"Cfx.re: Insecure mode", MB_OK | MB_ICONWARNING);',
+            'AddComponent(new DllGameComponent(va(PLATFORM_LIBRARY_STRING, L"sticky")));'
+          )) {
+            if (-not $componentSource.Contains($requiredText)) {
+              throw "Required insecure-mode behavior is missing: $requiredText"
+            }
+          }
+          if ([regex]::Matches($componentSource, [regex]::Escape($warningMarker)).Count -ne 1) {
+            throw "Expected exactly one Wine insecure-mode marker."
+          }
+          if ([regex]::Matches($componentSource, [regex]::Escape('MessageBoxW(')).Count -ne 1) {
+            throw "The Windows-on-ARM MessageBox is missing or duplicated."
+          }
+          $wineBranchPattern = '(?s)if \(CfxIsWine\(\)\)\s*\{\s*trace\("\[WineInsecureMode\] insecure mode active; adhesive unsupported; sticky fallback enabled\\n"\);\s*\}\s*else\s*\{\s*MessageBoxW'
+          if (-not [regex]::IsMatch($componentSource, $wineBranchPattern)) {
+            throw "Wine tracing and the Windows-on-ARM MessageBox are not isolated by the required if/else."
+          }
+
+          $nuiPath = 'code/components/nui-core/src/NUIWindow.cpp'
+          $nuiSource = Get-Content $nuiPath -Raw
+          $sharedAssignment = 'info.shared_texture_enabled = nuiSharedResourcesEnabled;'
+          $obsoleteAssignment = 'info.shared_texture_enabled = (!CfxIsWine() && nuiSharedResourcesEnabled);'
+          if ([regex]::Matches($nuiSource, [regex]::Escape($sharedAssignment)).Count -ne 1) {
+            throw "The NUI shared-texture assignment is missing or duplicated."
+          }
+          if ($nuiSource.Contains($obsoleteAssignment)) {
+            throw "The obsolete Wine-disabled NUI assignment is present."
+          }
+
+          $vidPath = 'code/components/gta-core-five/src/VidBehavior.cpp'
+          $vidSource = Get-Content $vidPath -Raw
+          foreach ($requiredText in @(
+            '[WineDeckOrientationCompat] api=EnumDisplaySettingsW normalized GTA display orientation',
+            '[WineDeckOrientationCompat] api=QueryDisplayConfig normalized GTA display orientation',
+            'mode->dmDisplayOrientation = DMDO_DEFAULT;',
+            'pathArray[i].targetInfo.rotation = DISPLAYCONFIG_ROTATION_IDENTITY;',
+            'hook::iat("user32.dll", NormalizeEnumDisplaySettingsW, "EnumDisplaySettingsW")',
+            'hook::iat("user32.dll", NormalizeQueryDisplayConfig, "QueryDisplayConfig")'
+          )) {
+            if (-not $vidSource.Contains($requiredText)) {
+              throw "Required orientation compatibility behavior is missing: $requiredText"
+            }
+          }
+          if ([regex]::Matches($vidSource, [regex]::Escape('[WineDeckOrientationCompat]')).Count -ne 2) {
+            throw "Expected exactly two change-only orientation markers."
+          }
+          if ($vidSource -match '\[WineDisplayApi\]|\[WineResSettings\]|\[WineGeometry\]|\[WineDisplay\]|GetDisplayTraceCaller|_ReturnAddress') {
+            throw "Diagnostic display bulk logging is present."
+          }
+          if ($vidSource -match 'UseXRandR|virtual desktop|explorer\s+/desktop') {
+            throw "Wine virtual-desktop or XRandR behavior is present in VidBehavior.cpp."
+          }
+
+          $orientationDiff = @(git diff --unified=0 $env:ORIENTATION_BASE_COMMIT $env:GITHUB_SHA -- $vidPath)
+          $addedOrientationLines = @($orientationDiff | Where-Object { $_ -match '^\+[^+]' })
+          $orientationAssignments = @($addedOrientationLines | Where-Object {
+            $_ -match '^\+\s*mode->dmDisplayOrientation\s*=\s*DMDO_DEFAULT;' -or
+            $_ -match '^\+\s*pathArray\[i\]\.targetInfo\.rotation\s*=\s*DISPLAYCONFIG_ROTATION_IDENTITY;'
+          })
+          if ($orientationAssignments.Count -ne 2) {
+            throw "Expected exactly the two approved orientation assignments; found $($orientationAssignments.Count)."
+          }
+          $forbiddenOrientationLines = @($addedOrientationLines | Where-Object {
+            ($_ -match 'mode->dm[A-Za-z0-9_]+\s*=(?!=)' -and $_ -notmatch 'mode->dmDisplayOrientation\s*=\s*DMDO_DEFAULT;') -or
+            ($_ -match 'pathArray\[[^\]]+\]\.targetInfo\.[A-Za-z0-9_]+\s*=(?!=)' -and $_ -notmatch 'pathArray\[i\]\.targetInfo\.rotation\s*=\s*DISPLAYCONFIG_ROTATION_IDENTITY;') -or
+            $_ -match 'dm(PelsWidth|PelsHeight|DisplayFrequency|Position|BitsPerPel|DisplayFlags|Fields)\s*=(?!=)' -or
+            $_ -match '(sourceMode\.(width|height)|activeSize\.(cx|cy))\s*=(?!=)' -or
+            $_ -match '(->|\.)(rcMonitor|rcWork)\s*=(?!=)' -or
+            $_ -match '(settings\s*\+\s*(248|252|260|264)).*\)\s*=(?!=)' -or
+            $_ -match '\b(CreateWindowExW|ChangeDisplaySettings|SetDisplayConfig|MoveWindow|SetWindowPos|ResizeBuffers)\s*\(' -or
+            $_ -match '\b(g_resolution|g_realResolution)\b'
+          })
+          if ($forbiddenOrientationLines.Count -ne 0) {
+            throw "Orientation-only guard found a forbidden display mutation: $($forbiddenOrientationLines -join ' | ')"
+          }
+
+          foreach ($forbiddenFile in @(
+            'code/client/shared/EarlyStartupTrace.h',
+            'code/client/shared/EarlyStartupRawTrace.h',
+            'code/tools/decode_early_startup_trace.py'
+          )) {
+            if (Test-Path $forbiddenFile) {
+              throw "Unexpected early-startup instrumentation file: $forbiddenFile"
+            }
+          }
+          git -C vendor/minhook diff --quiet
+          if ($LASTEXITCODE -ne 0) {
+            throw "MinHook differs from its pinned submodule commit."
+          }
+          $minHookSource = Get-Content 'vendor/minhook/src/hook.c' -Raw
+          if ($minHookSource -match 'CfxEarlyRawTrace|EarlyStartup|FreezeEnter') {
+            throw "MinHook diagnostic instrumentation is present."
+          }
+
+          git diff --quiet $env:PINNED_UPSTREAM_COMMIT $env:GITHUB_SHA -- 'code/components/rage-graphics-five'
+          if ($LASTEXITCODE -ne 0) {
+            throw "rage-graphics-five source differs from the pinned upstream source."
+          }
+
+          Write-Host 'Complete parent-to-release diff:'
+          git --no-pager diff --no-ext-diff --stat $env:RELEASE_BASE_COMMIT $env:GITHUB_SHA
+          git --no-pager diff --no-ext-diff $env:RELEASE_BASE_COMMIT $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to print the complete release diff."
+          }
+
+      - name: Download pinned CEF dependency
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 get-chrome
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned CEF dependency setup failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Generate udis86 tables required by CitiCore
+        shell: cmd
+        working-directory: 'C:\b\five'
+        run: |
+          call code\prebuild_udis86.cmd
+          if errorlevel 1 exit /b 1
+          if not exist vendor\udis86\libudis86\itab.c exit /b 1
+          if not exist vendor\udis86\libudis86\itab.h exit /b 1
+
+      - name: Generate VS2022 projects once
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 gen -game five
+          if ($LASTEXITCODE -ne 0) {
+            throw "FiveM project generation failed."
+          }
+
+          $oldTreeReferences = Get-ChildItem 'code\build\five' -Filter '*.vcxproj' -File |
+            Select-String -SimpleMatch 'C:\fivem-wine'
+          if ($oldTreeReferences) {
+            throw "Generated projects unexpectedly reference the old C:\fivem-wine tree."
+          }
+
+      - name: Install proven code-generation Python dependencies
+        shell: pwsh
+        run: |
+          py -3 -m pip install Jinja2 MarkupSafe "ply>=3.6,<4.0" six
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python dependency installation failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Audit output ownership source compilation and dependency closure
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          $buildRoot = Join-Path $env:SOURCE_ROOT 'code\build\five'
+          $sourceOwners = [ordered]@{
+            'code\client\launcher\Console.Logging.cpp' = 'CitiLaunch.vcxproj'
+            'code\client\launcher\Main.cpp' = 'CitiLaunch.vcxproj'
+            'code\client\citicore\SEHTableHandler.Win32.cpp' = 'CitiCore.vcxproj'
+            'code\client\citicore\ComponentLoader.cpp' = 'CitiCore.vcxproj'
+            'code\components\nui-core\src\NUIWindow.cpp' = 'nui-core.vcxproj'
+            'code\components\gta-core-five\src\VidBehavior.cpp' = 'gta-core-five.vcxproj'
+          }
+
+          foreach ($entry in $sourceOwners.GetEnumerator()) {
+            $expectedSource = [System.IO.Path]::GetFullPath((Join-Path $env:SOURCE_ROOT $entry.Key))
+            $ownerProject = Join-Path $buildRoot $entry.Value
+            if (-not (Test-Path $ownerProject -PathType Leaf)) {
+              throw "Expected source-owner project was not found: $ownerProject"
+            }
+
+            [xml]$ownerXml = Get-Content $ownerProject -Raw
+            $ownerDirectory = Split-Path $ownerProject -Parent
+            $ownerMatches = @(
+              $ownerXml.SelectNodes("//*[local-name()='ClCompile']") |
+                Where-Object {
+                  $compiledSource = [System.IO.Path]::GetFullPath(
+                    (Join-Path $ownerDirectory ([string]$_.Include))
+                  )
+                  [System.StringComparer]::OrdinalIgnoreCase.Equals($compiledSource, $expectedSource)
+                }
+            )
+            if ($ownerMatches.Count -ne 1) {
+              throw "$($entry.Key) must occur exactly once in $($entry.Value); count=$($ownerMatches.Count)"
+            }
+            Write-Host "SOURCE_OWNER source=$($entry.Key) project=$($entry.Value) count=1"
+          }
+
+          $expectedProjects = [ordered]@{
+            'CitiLaunch.vcxproj' = @('FiveM', '.exe')
+            'CitiCore.vcxproj' = @('CoreRT', '.dll')
+            'nui-core.vcxproj' = @('nui-core', '.dll')
+            'gta-core-five.vcxproj' = @('gta-core-five', '.dll')
+          }
+
+          foreach ($entry in $expectedProjects.GetEnumerator()) {
+            $projectPath = Join-Path $buildRoot $entry.Key
+            if (-not (Test-Path $projectPath -PathType Leaf)) {
+              throw "Expected generated project was not found: $projectPath"
+            }
+
+            [xml]$projectXml = Get-Content $projectPath -Raw
+            $releasePropertyGroup = @(
+              $projectXml.SelectNodes("//*[local-name()='PropertyGroup']") |
+                Where-Object { $_.Condition -like '*Release|x64*' -and $_.OutDir }
+            )
+            if ($releasePropertyGroup.Count -ne 1) {
+              throw "Unable to identify one Release x64 output group in $projectPath."
+            }
+
+            $targetName = [string]$releasePropertyGroup[0].TargetName
+            $targetExt = [string]$releasePropertyGroup[0].TargetExt
+            if ($targetName -ne $entry.Value[0] -or $targetExt -ne $entry.Value[1]) {
+              throw "Unexpected target for $($entry.Key): $targetName$targetExt"
+            }
+
+            $projectDirectory = Split-Path $projectPath -Parent
+            $outDir = [System.IO.Path]::GetFullPath(
+              (Join-Path $projectDirectory ([string]$releasePropertyGroup[0].OutDir))
+            )
+            Write-Host "OUTPUT_OWNER output=$targetName$targetExt project=$($entry.Key) path=$(Join-Path $outDir "$targetName$targetExt")"
+            Write-Host "PDB_OWNER output=dbg/$targetName.pdb project=$($entry.Key) path=$(Join-Path $outDir "dbg\$targetName.pdb")"
+          }
+
+          function Get-ProjectClosure([string]$rootProject) {
+            $pending = [System.Collections.Generic.Stack[string]]::new()
+            $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $pending.Push([System.IO.Path]::GetFullPath($rootProject))
+
+            while ($pending.Count -gt 0) {
+              $project = [System.IO.Path]::GetFullPath($pending.Pop())
+              if (-not $seen.Add($project)) {
+                continue
+              }
+
+              [xml]$projectXml = Get-Content $project -Raw
+              foreach ($reference in $projectXml.SelectNodes("//*[local-name()='ProjectReference']")) {
+                $include = [string]$reference.Include
+                if ($include -match '\$\(') {
+                  throw "Unresolved project-reference path in ${project}: $include"
+                }
+                $referencedProject = [System.IO.Path]::GetFullPath(
+                  (Join-Path (Split-Path $project -Parent) $include)
+                )
+                if (-not (Test-Path $referencedProject -PathType Leaf)) {
+                  throw "Missing project reference: $referencedProject"
+                }
+                $pending.Push($referencedProject)
+              }
+            }
+
+            return @($seen | Sort-Object)
+          }
+
+          $rootProjects = @(
+            'CitiLaunch.vcxproj',
+            'CitiCore.vcxproj',
+            'nui-core.vcxproj',
+            'gta-core-five.vcxproj'
+          )
+          $union = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($rootName in $rootProjects) {
+            $closure = @(Get-ProjectClosure (Join-Path $buildRoot $rootName))
+            foreach ($project in $closure) {
+              $null = $union.Add($project)
+              $relativeProject = [System.IO.Path]::GetRelativePath($env:SOURCE_ROOT, $project).Replace('\', '/')
+              Write-Host "PROJECT_CLOSURE root=$rootName project=$relativeProject"
+            }
+          }
+
+          Write-Host "UNION_CLOSURE_COUNT=$($union.Count)"
+          foreach ($project in @($union | Sort-Object)) {
+            $relativeProject = [System.IO.Path]::GetRelativePath($env:SOURCE_ROOT, $project).Replace('\', '/')
+            Write-Host "UNION_CLOSURE project=$relativeProject"
+          }
+
+          $legitimacyProjects = @($union | Where-Object {
+            [System.IO.Path]::GetFileName($_) -ieq 'legitimacy.vcxproj'
+          })
+          foreach ($legitimacyProject in $legitimacyProjects) {
+            [xml]$legitimacyXml = Get-Content $legitimacyProject -Raw
+            $configurationTypes = @(
+              $legitimacyXml.SelectNodes("//*[local-name()='ConfigurationType']") |
+                ForEach-Object { $_.'#text' } |
+                Sort-Object -Unique
+            )
+            if ($configurationTypes.Count -ne 1 -or $configurationTypes[0] -ne 'Utility') {
+              throw "legitimacy is not the expected pinned Utility project."
+            }
+            if (@($legitimacyXml.SelectNodes("//*[local-name()='ClCompile']")).Count -ne 0) {
+              throw "legitimacy unexpectedly contains compile items."
+            }
+            Write-Host 'LEGITIMACY_AUDIT type=Utility compile_items=0 packaged=false'
+          }
+
+          $rageGraphicsProjects = @($union | Where-Object {
+            [System.IO.Path]::GetFileName($_) -ieq 'rage-graphics-five.vcxproj'
+          })
+          Write-Host "RAGE_GRAPHICS_TRANSITIVE_PROJECT_COUNT=$($rageGraphicsProjects.Count)"
+          Write-Host 'Only the four named root projects and their generated ProjectReference closures will be built.'
+
+      - name: Build minimal four-output Release x64 project closure
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = (& $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath).Trim()
+          if (-not $vsRoot) {
+            throw "Visual Studio 2022 with x64 C++ tools was not found."
+          }
+
+          $msbuild = Join-Path $vsRoot 'MSBuild\Current\Bin\MSBuild.exe'
+          $buildRoot = Join-Path $env:SOURCE_ROOT 'code\build\five'
+          $projects = @(
+            'CitiLaunch.vcxproj',
+            'CitiCore.vcxproj',
+            'nui-core.vcxproj',
+            'gta-core-five.vcxproj'
+          )
+
+          $env:UseMultiToolTask = 'true'
+          $env:EnforceProcessCountAcrossBuilds = 'true'
+
+          foreach ($projectName in $projects) {
+            $project = Join-Path $buildRoot $projectName
+            Write-Host "BUILD_ROOT project=$projectName"
+            & $msbuild $project `
+              /t:Build `
+              /m:4 `
+              /nr:false `
+              /v:minimal `
+              /p:Configuration=Release `
+              /p:Platform=x64 `
+              /p:PreferredToolArchitecture=x64 `
+              "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION" `
+              /p:BuildProjectReferences=true
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "$projectName build failed with exit code $LASTEXITCODE."
+            }
+          }
+
+      - name: Stage exact six-file DLL-only overlay and compare proven identities
+        shell: pwsh
+        run: |
+          $releaseRoot = Join-Path $env:SOURCE_ROOT 'code\bin\five\release'
+          $sourceFiles = [ordered]@{
+            'CoreRT.dll' = (Join-Path $releaseRoot 'CoreRT.dll')
+            'nui-core.dll' = (Join-Path $releaseRoot 'nui-core.dll')
+            'gta-core-five.dll' = (Join-Path $releaseRoot 'gta-core-five.dll')
+            'dbg/CoreRT.pdb' = (Join-Path $releaseRoot 'dbg\CoreRT.pdb')
+            'dbg/nui-core.pdb' = (Join-Path $releaseRoot 'dbg\nui-core.pdb')
+            'dbg/gta-core-five.pdb' = (Join-Path $releaseRoot 'dbg\gta-core-five.pdb')
+          }
+
+          foreach ($sourcePath in $sourceFiles.Values) {
+            if (-not (Test-Path $sourcePath -PathType Leaf)) {
+              throw "Expected targeted output was not produced: $sourcePath"
+            }
+          }
+
+          New-Item -ItemType Directory -Force $env:ARTIFACT_ROOT | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $env:ARTIFACT_ROOT 'dbg') | Out-Null
+          foreach ($entry in $sourceFiles.GetEnumerator()) {
+            $destination = Join-Path $env:ARTIFACT_ROOT ($entry.Key -replace '/', '\')
+            Copy-Item -LiteralPath $entry.Value -Destination $destination
+          }
+
+          $actualFiles = @(
+            Get-ChildItem $env:ARTIFACT_ROOT -Recurse -File |
+              ForEach-Object {
+                $_.FullName.Substring($env:ARTIFACT_ROOT.Length).TrimStart('\') -replace '\\', '/'
+              } |
+              Sort-Object
+          )
+          $expectedFiles = @(
+            'CoreRT.dll',
+            'nui-core.dll',
+            'gta-core-five.dll',
+            'dbg/CoreRT.pdb',
+            'dbg/nui-core.pdb',
+            'dbg/gta-core-five.pdb'
+          ) | Sort-Object
+          if (($actualFiles -join "`n") -ne ($expectedFiles -join "`n")) {
+            throw "Artifact contents differ from the exact six-file allowlist. Actual: $($actualFiles -join ', ')"
+          }
+
+          $provenHashes = @{
+            'CoreRT.dll' = '4650a854fdc5ac37a23d95e8994ea7778e2092ed3c47cffcd2f030b90aa4d03a'
+            'nui-core.dll' = '51265b42278435bacbda484b5bb0b6c59f7bc71fbf7f1c5f03e8b0544cc65914'
+            'gta-core-five.dll' = 'ae9ea06023302db862f5a50cb3c0318fcdd4c07ce3e73883b9f222250936d381'
+          }
+
+          Write-Host "RELEASE_BRANCH=$($env:GITHUB_REF_NAME)"
+          Write-Host "RELEASE_HEAD=$($env:GITHUB_SHA)"
+          Write-Host "RELEASE_BASE=$($env:RELEASE_BASE_COMMIT)"
+          Write-Host "RELEASE_BASE_TREE=$($env:RELEASE_BASE_TREE)"
+          Write-Host 'Exact overlay files and SHA256:'
+          foreach ($relativePath in $actualFiles) {
+            $fullPath = Join-Path $env:ARTIFACT_ROOT ($relativePath -replace '/', '\')
+            $hash = (Get-FileHash $fullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "ARTIFACT_FILE path=$relativePath sha256=$hash"
+
+            if ($provenHashes.ContainsKey($relativePath)) {
+              $expectedHash = $provenHashes[$relativePath]
+              if ($hash -eq $expectedHash) {
+                Write-Host "PROVEN_HASH_MATCH path=$relativePath sha256=$hash"
+              }
+              else {
+                Write-Warning "PROVEN_HASH_DIFFERENCE path=$relativePath expected=$expectedHash actual=$hash"
+              }
+            }
+          }
+
+          foreach ($forbiddenPath in @(
+            'FiveM.exe',
+            'dbg/FiveM.pdb',
+            'rage-graphics-five.dll'
+          )) {
+            if ($actualFiles -contains $forbiddenPath) {
+              throw "Forbidden runtime file must not be packaged: $forbiddenPath"
+            }
+            Write-Host "FORBIDDEN_ARTIFACT_ABSENT path=$forbiddenPath"
+          }
+          foreach ($crtName in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+            if ($actualFiles -contains $crtName) {
+              throw "Runtime CRT file must not be packaged: $crtName"
+            }
+          }
+
+      - name: Upload exact Wine Steam Deck compatibility overlay
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FiveM-official-wine-steamdeck-compat-release
+          path: C:\b\artifact
+          if-no-files-found: error
+
+      - name: Report uploaded artifact identity
+        shell: pwsh
+        run: |
+          Write-Host "ARTIFACT_ID=${{ steps.upload.outputs.artifact-id }}"
+          Write-Host "ARTIFACT_URL=${{ steps.upload.outputs.artifact-url }}"
+          Write-Host "ARTIFACT_ZIP_SHA256=${{ steps.upload.outputs.artifact-digest }}"
