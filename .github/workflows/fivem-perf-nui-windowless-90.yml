@@ -35,6 +35,17 @@ jobs:
           git -C $env:SOURCE_ROOT checkout --detach FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { throw "Root repository checkout failed." }
 
+          foreach ($ancestor in @(
+            $env:PINNED_UPSTREAM_COMMIT,
+            $env:EXPERIMENT_BASE_COMMIT
+          )) {
+            git -C $env:SOURCE_ROOT cat-file -e "$ancestor^{commit}" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              git -C $env:SOURCE_ROOT fetch --no-tags --depth=1 origin $ancestor
+              if ($LASTEXITCODE -ne 0) { throw "Required ancestor fetch failed: $ancestor" }
+            }
+          }
+
           git -C $env:SOURCE_ROOT merge-base --is-ancestor $env:PINNED_UPSTREAM_COMMIT $env:GITHUB_SHA
           if ($LASTEXITCODE -ne 0) { throw "Pinned upstream is not an ancestor." }
 
