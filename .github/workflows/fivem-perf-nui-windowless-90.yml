@@ -1,0 +1,193 @@
+name: FiveM Perf NUI Windowless 90
+
+on:
+  push:
+    branches:
+      - diagnostics/perf-nui-windowless-90
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      SOURCE_ROOT: 'C:\b\five'
+      WINDOWS_SDK_VERSION: '10.0.22621.0'
+      PINNED_UPSTREAM_COMMIT: '0d8a2a6f78a9922445d8930305af82a7b1826980'
+      EXPERIMENT_BASE_COMMIT: '0364d6ec854d376a51dd2d44a9a3a39484a23d5a'
+      NUI_PATH: 'code/components/nui-core/src/NUIWindow.cpp'
+
+    steps:
+      - name: Checkout exact experiment source
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+          New-Item -ItemType Directory -Force C:\b | Out-Null
+          git init $env:SOURCE_ROOT
+          git -C $env:SOURCE_ROOT config core.symlinks true
+          git -C $env:SOURCE_ROOT remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY.git"
+          git -C $env:SOURCE_ROOT fetch --no-tags --depth=16 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Root repository fetch failed." }
+          git -C $env:SOURCE_ROOT checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Root repository checkout failed." }
+
+          git -C $env:SOURCE_ROOT merge-base --is-ancestor $env:PINNED_UPSTREAM_COMMIT $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Pinned upstream is not an ancestor." }
+
+          git -C $env:SOURCE_ROOT merge-base --is-ancestor $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Experiment base is not an ancestor." }
+
+          git -C $env:SOURCE_ROOT submodule sync --recursive
+          git -C $env:SOURCE_ROOT submodule update --init --recursive --depth=1 --jobs=4
+          if ($LASTEXITCODE -ne 0) { throw "Submodule checkout failed." }
+
+      - name: Audit exact A-B source delta
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          $workflowPath = '.github/workflows/fivem-perf-nui-windowless-90.yml'
+          $allowedFiles = @($env:NUI_PATH, $workflowPath)
+          $changedFiles = @(git diff --name-only $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA)
+
+          Write-Host "EXPERIMENT_BASE=$($env:EXPERIMENT_BASE_COMMIT)"
+          Write-Host "EXPERIMENT_HEAD=$($env:GITHUB_SHA)"
+          Write-Host 'Changed files:'
+          $changedFiles | ForEach-Object { Write-Host "  $_" }
+
+          if ($changedFiles.Count -ne 2) {
+            throw "Expected exactly two changed files (NUI source + workflow), found $($changedFiles.Count)."
+          }
+          foreach ($required in $allowedFiles) {
+            if ($required -notin $changedFiles) { throw "Required changed file missing: $required" }
+          }
+          $unexpected = @($changedFiles | Where-Object { $_ -notin $allowedFiles })
+          if ($unexpected.Count -ne 0) { throw "Unexpected changed files: $($unexpected -join ', ')" }
+
+          $nuiSource = Get-Content $env:NUI_PATH -Raw
+          if ([regex]::Matches($nuiSource, [regex]::Escape('settings.windowless_frame_rate = 90;')).Count -ne 1) {
+            throw "Expected exactly one windowless_frame_rate=90 assignment."
+          }
+          if ($nuiSource.Contains('settings.windowless_frame_rate = 240;')) {
+            throw "Control value 240 is still present."
+          }
+
+          $nuiDiff = @(git diff --unified=0 $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA -- $env:NUI_PATH)
+          $added = @($nuiDiff | Where-Object { $_ -match '^\+[^+]' })
+          $removed = @($nuiDiff | Where-Object { $_ -match '^-[^-]' })
+          if ($added.Count -ne 1 -or $removed.Count -ne 1) {
+            throw "NUI source delta is not exactly one replacement line."
+          }
+          if ($added[0].Trim() -ne '+	settings.windowless_frame_rate = 90;') {
+            throw "Unexpected added source line: $($added[0])"
+          }
+          if ($removed[0].Trim() -ne '-	settings.windowless_frame_rate = 240;') {
+            throw "Unexpected removed source line: $($removed[0])"
+          }
+
+          $sharedAssignment = 'info.shared_texture_enabled = nuiSharedResourcesEnabled;'
+          if ([regex]::Matches($nuiSource, [regex]::Escape($sharedAssignment)).Count -ne 1) {
+            throw "Proven shared-texture compatibility assignment is missing or duplicated."
+          }
+
+          $coreSource = Get-Content 'code/client/citicore/SEHTableHandler.Win32.cpp' -Raw
+          if (-not $coreSource.Contains('if (baseAddress && !CfxIsWine() && GetModuleHandle(L"xtajit64.dll") == nullptr)')) {
+            throw "Proven CoreRT Wine guard is missing."
+          }
+
+          $vidSource = Get-Content 'code/components/gta-core-five/src/VidBehavior.cpp' -Raw
+          foreach ($requiredText in @(
+            'mode->dmDisplayOrientation = DMDO_DEFAULT;',
+            'pathArray[i].targetInfo.rotation = DISPLAYCONFIG_ROTATION_IDENTITY;'
+          )) {
+            if (-not $vidSource.Contains($requiredText)) {
+              throw "Proven Deck orientation compatibility behavior is missing: $requiredText"
+            }
+          }
+
+          git diff --quiet $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA -- 'code/components/gta-core-five/src/VidBehavior.cpp'
+          if ($LASTEXITCODE -ne 0) { throw "Orientation source changed in performance experiment." }
+
+          git diff --quiet $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA -- 'code/components/rage-graphics-five'
+          if ($LASTEXITCODE -ne 0) { throw "rage-graphics-five changed in performance experiment." }
+
+          Write-Host 'Exact NUI functional diff:'
+          git --no-pager diff --no-ext-diff $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA -- $env:NUI_PATH
+
+      - name: Download pinned CEF dependency
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 get-chrome
+          if ($LASTEXITCODE -ne 0) { throw "Pinned CEF dependency setup failed." }
+
+      - name: Generate VS2022 projects
+        shell: pwsh
+        working-directory: 'C:\b\five'
+        run: |
+          & .\fxd.ps1 gen -game five
+          if ($LASTEXITCODE -ne 0) { throw "FiveM project generation failed." }
+
+      - name: Install nui-core code-generation dependencies
+        shell: pwsh
+        run: |
+          py -3 -m pip install Jinja2 MarkupSafe "ply>=3.6,<4.0" six
+          if ($LASTEXITCODE -ne 0) { throw "Python dependency installation failed." }
+
+      - name: Build only nui-core Release x64
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $vsRoot) { throw "Visual Studio 2022 x64 C++ tools not found." }
+
+          $msbuild = Join-Path $vsRoot 'MSBuild\Current\Bin\MSBuild.exe'
+          $project = Join-Path $env:SOURCE_ROOT 'code\build\five\nui-core.vcxproj'
+          if (-not (Test-Path $project -PathType Leaf)) { throw "nui-core project not found." }
+
+          $env:UseMultiToolTask = 'true'
+          $env:EnforceProcessCountAcrossBuilds = 'true'
+          & $msbuild $project /t:Build /m:4 /nr:false /v:minimal /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION" /p:BuildProjectReferences=true
+          if ($LASTEXITCODE -ne 0) { throw "nui-core build failed with exit code $LASTEXITCODE." }
+
+      - name: Stage exact NUI overlay
+        shell: pwsh
+        run: |
+          $dll = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\nui-core.dll'
+          $pdb = Join-Path $env:SOURCE_ROOT 'code\bin\five\release\dbg\nui-core.pdb'
+          foreach ($path in @($dll, $pdb)) {
+            if (-not (Test-Path $path -PathType Leaf)) { throw "Expected output missing: $path" }
+          }
+
+          New-Item -ItemType Directory -Force 'C:\b\artifact\dbg' | Out-Null
+          Copy-Item $dll 'C:\b\artifact\nui-core.dll'
+          Copy-Item $pdb 'C:\b\artifact\dbg\nui-core.pdb'
+
+          $files = @(Get-ChildItem 'C:\b\artifact' -Recurse -File | ForEach-Object {
+            $_.FullName.Substring('C:\b\artifact'.Length).TrimStart('\') -replace '\\','/'
+          } | Sort-Object)
+          $expected = @('dbg/nui-core.pdb','nui-core.dll') | Sort-Object
+          if (($files -join "`n") -ne ($expected -join "`n")) {
+            throw "Artifact contents are not exactly nui-core.dll + PDB."
+          }
+
+          Write-Host "NUI_DLL_SHA256=$((Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant())"
+          Write-Host "NUI_PDB_SHA256=$((Get-FileHash $pdb -Algorithm SHA256).Hash.ToLowerInvariant())"
+
+      - name: Upload NUI 90 Hz performance artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FiveM-perf-nui-windowless-90
+          path: C:\b\artifact
+          if-no-files-found: error
+
+      - name: Report artifact identity
+        shell: pwsh
+        run: |
+          Write-Host "ARTIFACT_ID=${{ steps.upload.outputs.artifact-id }}"
+          Write-Host "ARTIFACT_URL=${{ steps.upload.outputs.artifact-url }}"
+          Write-Host "ARTIFACT_ZIP_SHA256=${{ steps.upload.outputs.artifact-digest }}"
