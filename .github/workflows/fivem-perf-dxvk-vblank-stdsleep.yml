@@ -36,15 +36,25 @@ jobs:
           test "$(git rev-parse HEAD)" = "$DXVK_COMMIT"
           git status --short
 
-      - name: Create matching CONTROL and PATCHED trees
+      - name: Build CONTROL once and preserve exact binaries
         shell: bash
         run: |
           set -euxo pipefail
-          cp -a dxvk dxvk-control
-          cp -a dxvk dxvk-patched
+          cd dxvk
+          ./package-release.sh fivem-vblank-ab ../out --dev-build --64-only
+          test -f ../out/dxvk-fivem-vblank-ab/x64/dxgi.dll
+          test -f ../out/dxvk-fivem-vblank-ab/x64/d3d11.dll
+          mkdir -p ../artifact/control ../artifact/patched
+          cp ../out/dxvk-fivem-vblank-ab/x64/dxgi.dll ../artifact/control/
+          cp ../out/dxvk-fivem-vblank-ab/x64/d3d11.dll ../artifact/control/
+
+      - name: Apply exactly one VBlank source replacement
+        shell: bash
+        run: |
+          set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          p=Path("dxvk-patched/src/dxgi/dxgi_output.cpp")
+          p=Path("dxvk/src/dxgi/dxgi_output.cpp")
           s=p.read_text()
           old="    Sleep::sleepUntil(t1, t2);"
           new="    std::this_thread::sleep_until(t2);"
@@ -53,61 +63,59 @@ jobs:
           p.write_text(s.replace(old,new))
           PY
 
-          git -C dxvk-control diff --exit-code
-          git -C dxvk-patched diff -- src/dxgi/dxgi_output.cpp
-          test "$(git -C dxvk-patched diff --name-only | wc -l)" -eq 1
-          test "$(git -C dxvk-patched diff --name-only)" = "src/dxgi/dxgi_output.cpp"
-          test "$(git -C dxvk-patched diff --numstat -- src/dxgi/dxgi_output.cpp)" = $'1	1	src/dxgi/dxgi_output.cpp'
+          test "$(git -C dxvk diff --name-only)" = "src/dxgi/dxgi_output.cpp"
+          test "$(git -C dxvk diff --numstat -- src/dxgi/dxgi_output.cpp)" = $'1\t1\tsrc/dxgi/dxgi_output.cpp'
+          git -C dxvk --no-pager diff -- src/dxgi/dxgi_output.cpp
 
-      - name: Build CONTROL x64
+      - name: Incrementally rebuild PATCHED from same build tree
         shell: bash
         run: |
           set -euxo pipefail
-          cd dxvk-control
-          ./package-release.sh control ../out-control --no-package --64-only
-          test -f ../out-control/dxvk-control/x64/dxgi.dll
-          test -f ../out-control/dxvk-control/x64/d3d11.dll
+          ninja -C out/dxvk-fivem-vblank-ab/build.64 install
+          cp out/dxvk-fivem-vblank-ab/x64/dxgi.dll artifact/patched/
+          cp out/dxvk-fivem-vblank-ab/x64/d3d11.dll artifact/patched/
 
-      - name: Build PATCHED x64
+      - name: Audit exact A-B scope
         shell: bash
         run: |
           set -euxo pipefail
-          cd dxvk-patched
-          ./package-release.sh patched ../out-patched --no-package --64-only
-          test -f ../out-patched/dxvk-patched/x64/dxgi.dll
-          test -f ../out-patched/dxvk-patched/x64/d3d11.dll
 
-      - name: Audit exact A-B scope and stage artifacts
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p artifact/control artifact/patched
+          CONTROL_DXGI_SHA256=$(sha256sum artifact/control/dxgi.dll | awk '{print $1}')
+          CONTROL_D3D11_SHA256=$(sha256sum artifact/control/d3d11.dll | awk '{print $1}')
+          PATCHED_DXGI_SHA256=$(sha256sum artifact/patched/dxgi.dll | awk '{print $1}')
+          PATCHED_D3D11_SHA256=$(sha256sum artifact/patched/d3d11.dll | awk '{print $1}')
 
-          cp out-control/dxvk-control/x64/dxgi.dll artifact/control/
-          cp out-control/dxvk-control/x64/d3d11.dll artifact/control/
-          cp out-patched/dxvk-patched/x64/dxgi.dll artifact/patched/
-          cp out-patched/dxvk-patched/x64/d3d11.dll artifact/patched/
+          echo "CONTROL_DXGI_SHA256=$CONTROL_DXGI_SHA256"
+          echo "CONTROL_D3D11_SHA256=$CONTROL_D3D11_SHA256"
+          echo "PATCHED_DXGI_SHA256=$PATCHED_DXGI_SHA256"
+          echo "PATCHED_D3D11_SHA256=$PATCHED_D3D11_SHA256"
 
-          echo "CONTROL_DXGI_SHA256=$(sha256sum artifact/control/dxgi.dll | awk '{print $1}')"
-          echo "CONTROL_D3D11_SHA256=$(sha256sum artifact/control/d3d11.dll | awk '{print $1}')"
-          echo "PATCHED_DXGI_SHA256=$(sha256sum artifact/patched/dxgi.dll | awk '{print $1}')"
-          echo "PATCHED_D3D11_SHA256=$(sha256sum artifact/patched/d3d11.dll | awk '{print $1}')"
+          # d3d11 was built once before the source patch and must remain byte-identical.
+          cmp artifact/control/d3d11.dll artifact/patched/d3d11.dll
+          test "$CONTROL_D3D11_SHA256" = "$PATCHED_D3D11_SHA256"
 
-          cmp -s artifact/control/d3d11.dll artifact/patched/d3d11.dll
-          test "$(sha256sum artifact/control/d3d11.dll | awk '{print $1}')" = "$(sha256sum artifact/patched/d3d11.dll | awk '{print $1}')"
+          # dxgi must change, since its WaitForVBlank implementation is the experiment.
+          test "$CONTROL_DXGI_SHA256" != "$PATCHED_DXGI_SHA256"
 
-          git -C dxvk-patched diff --exit-code -- src/util
-          git -C dxvk-patched diff --exit-code -- src/d3d11
-          git -C dxvk-patched diff --exit-code -- src/dxvk
-          git -C dxvk-patched diff --exit-code -- src/wsi
+          # No general sleep, D3D11, DXVK core or WSI source may differ from v3.1.
+          git -C dxvk diff --exit-code -- src/util
+          git -C dxvk diff --exit-code -- src/d3d11
+          git -C dxvk diff --exit-code -- src/dxvk
+          git -C dxvk diff --exit-code -- src/wsi
+          test "$(git -C dxvk diff --name-only)" = "src/dxgi/dxgi_output.cpp"
 
           cat > artifact/identity.txt <<EOF
           DXVK_COMMIT=$DXVK_COMMIT
+          BUILD_MODEL=one source tree; one CONTROL build; incremental PATCHED rebuild
           PATCH=src/dxgi/dxgi_output.cpp only
           OLD=Sleep::sleepUntil(t1, t2);
           NEW=std::this_thread::sleep_until(t2);
-          CONTROL_INSTALLED_DXGI_SHA256=49cd72ff238d217da9f308a21b58530f3bbd080c9d2034317d21800c19074fdd
-          CONTROL_INSTALLED_D3D11_SHA256=0ec7afc6fd0b6a9c3896eb8cde6c4d5b384b1fb0ddf826d21455e9dbeb6defee
+          INSTALLED_DECK_DXGI_SHA256=49cd72ff238d217da9f308a21b58530f3bbd080c9d2034317d21800c19074fdd
+          INSTALLED_DECK_D3D11_SHA256=0ec7afc6fd0b6a9c3896eb8cde6c4d5b384b1fb0ddf826d21455e9dbeb6defee
+          CONTROL_DXGI_SHA256=$CONTROL_DXGI_SHA256
+          CONTROL_D3D11_SHA256=$CONTROL_D3D11_SHA256
+          PATCHED_DXGI_SHA256=$PATCHED_DXGI_SHA256
+          PATCHED_D3D11_SHA256=$PATCHED_D3D11_SHA256
           EOF
 
       - name: Upload CONTROL and PATCHED DXVK artifact
