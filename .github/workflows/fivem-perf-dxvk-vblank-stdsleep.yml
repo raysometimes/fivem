@@ -64,8 +64,93 @@ jobs:
           PY
 
           test "$(git -C dxvk diff --name-only)" = "src/dxgi/dxgi_output.cpp"
-          test "$(git -C dxvk diff --numstat -- src/dxgi/dxgi_output.cpp)" = $'1\t1\tsrc/dxgi/dxgi_output.cpp'
+          test "$(git -C dxvk diff --numstat -- src/dxgi/dxgi_output.cpp)" =         shell: bash
+        run: |
+          set -euxo pipefail
+          ninja -C out/dxvk-fivem-vblank-ab/build.64 install
+          cp out/dxvk-fivem-vblank-ab/x64/dxgi.dll artifact/patched/
+          cp out/dxvk-fivem-vblank-ab/x64/d3d11.dll artifact/patched/
+
+      - name: Audit exact A-B scope
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          CONTROL_DXGI_SHA256=$(sha256sum artifact/control/dxgi.dll | awk '{print $1}')
+          CONTROL_D3D11_SHA256=$(sha256sum artifact/control/d3d11.dll | awk '{print $1}')
+          PATCHED_DXGI_SHA256=$(sha256sum artifact/patched/dxgi.dll | awk '{print $1}')
+          PATCHED_D3D11_SHA256=$(sha256sum artifact/patched/d3d11.dll | awk '{print $1}')
+
+          echo "CONTROL_DXGI_SHA256=$CONTROL_DXGI_SHA256"
+          echo "CONTROL_D3D11_SHA256=$CONTROL_D3D11_SHA256"
+          echo "PATCHED_DXGI_SHA256=$PATCHED_DXGI_SHA256"
+          echo "PATCHED_D3D11_SHA256=$PATCHED_D3D11_SHA256"
+
+          # d3d11 was built once before the source patch and must remain byte-identical.
+          cmp artifact/control/d3d11.dll artifact/patched/d3d11.dll
+          test "$CONTROL_D3D11_SHA256" = "$PATCHED_D3D11_SHA256"
+
+          # dxgi must change, since its WaitForVBlank implementation is the experiment.
+          test "$CONTROL_DXGI_SHA256" != "$PATCHED_DXGI_SHA256"
+
+          # No general sleep, D3D11, DXVK core or WSI source may differ from v3.1.
+          git -C dxvk diff --exit-code -- src/util
+          git -C dxvk diff --exit-code -- src/d3d11
+          git -C dxvk diff --exit-code -- src/dxvk
+          git -C dxvk diff --exit-code -- src/wsi
+
+          # assume-unchanged intentionally hides the one experimental file from
+          # git diff during the build. Re-verify its exact contents against HEAD.
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          p=Path("dxvk/src/dxgi/dxgi_output.cpp")
+          work=p.read_text()
+          base=subprocess.check_output(
+              ["git","-C","dxvk","show","HEAD:src/dxgi/dxgi_output.cpp"],
+              text=True)
+          old="    Sleep::sleepUntil(t1, t2);"
+          new="    std::this_thread::sleep_until(t2);"
+          assert base.count(old)==1 and new not in base
+          expected=base.replace(old,new)
+          assert work==expected
+          PY
+
+          cat > artifact/identity.txt <<EOF
+          DXVK_COMMIT=$DXVK_COMMIT
+          BUILD_MODEL=one source tree; one CONTROL build; incremental PATCHED rebuild
+          PATCH=src/dxgi/dxgi_output.cpp only
+          OLD=Sleep::sleepUntil(t1, t2);
+          NEW=std::this_thread::sleep_until(t2);
+          INSTALLED_DECK_DXGI_SHA256=49cd72ff238d217da9f308a21b58530f3bbd080c9d2034317d21800c19074fdd
+          INSTALLED_DECK_D3D11_SHA256=0ec7afc6fd0b6a9c3896eb8cde6c4d5b384b1fb0ddf826d21455e9dbeb6defee
+          CONTROL_DXGI_SHA256=$CONTROL_DXGI_SHA256
+          CONTROL_D3D11_SHA256=$CONTROL_D3D11_SHA256
+          PATCHED_DXGI_SHA256=$PATCHED_DXGI_SHA256
+          PATCHED_D3D11_SHA256=$PATCHED_D3D11_SHA256
+          EOF
+
+      - name: Upload CONTROL and PATCHED DXVK artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FiveM-perf-dxvk-vblank-stdsleep
+          path: artifact
+          if-no-files-found: error
+
+      - name: Report artifact identity
+        shell: bash
+        run: |
+          echo "ARTIFACT_ID=${{ steps.upload.outputs.artifact-id }}"
+          echo "ARTIFACT_ZIP_SHA256=${{ steps.upload.outputs.artifact-digest }}"
+1\t1\tsrc/dxgi/dxgi_output.cpp'
           git -C dxvk --no-pager diff -- src/dxgi/dxgi_output.cpp
+
+          # Freeze VCS-derived version metadata for the A/B build only.
+          # The source file remains modified on disk (Ninja sees its mtime),
+          # while git describe --dirty=+ keeps the same CONTROL identity.
+          git -C dxvk update-index --assume-unchanged src/dxgi/dxgi_output.cpp
+          test "$(git -C dxvk describe --dirty=+)" = "$(git -C dxvk describe)"
 
       - name: Incrementally rebuild PATCHED from same build tree
         shell: bash
