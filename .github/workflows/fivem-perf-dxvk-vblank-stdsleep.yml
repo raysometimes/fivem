@@ -1,0 +1,125 @@
+name: FiveM Perf DXVK VBlank StdSleep
+
+on:
+  push:
+    branches:
+      - diagnostics/perf-dxvk-vblank-stdsleep
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      DXVK_REPO: https://github.com/doitsujin/dxvk.git
+      DXVK_COMMIT: 70d7508c01201ed3d4bfb33da42ba834eafe3857
+
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build mingw-w64 glslang-tools python3
+
+      - name: Checkout exact DXVK v3.1 source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --recursive "$DXVK_REPO" dxvk
+          cd dxvk
+          git checkout --detach "$DXVK_COMMIT"
+          git submodule update --init --recursive
+          test "$(git rev-parse HEAD)" = "$DXVK_COMMIT"
+          git status --short
+
+      - name: Create matching CONTROL and PATCHED trees
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp -a dxvk dxvk-control
+          cp -a dxvk dxvk-patched
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("dxvk-patched/src/dxgi/dxgi_output.cpp")
+          s=p.read_text()
+          old="    Sleep::sleepUntil(t1, t2);"
+          new="    std::this_thread::sleep_until(t2);"
+          assert s.count(old)==1, s.count(old)
+          assert new not in s
+          p.write_text(s.replace(old,new))
+          PY
+
+          git -C dxvk-control diff --exit-code
+          git -C dxvk-patched diff -- src/dxgi/dxgi_output.cpp
+          test "$(git -C dxvk-patched diff --name-only | wc -l)" -eq 1
+          test "$(git -C dxvk-patched diff --name-only)" = "src/dxgi/dxgi_output.cpp"
+          test "$(git -C dxvk-patched diff --numstat -- src/dxgi/dxgi_output.cpp)" = $'1	1	src/dxgi/dxgi_output.cpp'
+
+      - name: Build CONTROL x64
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd dxvk-control
+          ./package-release.sh control ../out-control --no-package --64-only
+          test -f ../out-control/dxvk-control/x64/dxgi.dll
+          test -f ../out-control/dxvk-control/x64/d3d11.dll
+
+      - name: Build PATCHED x64
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd dxvk-patched
+          ./package-release.sh patched ../out-patched --no-package --64-only
+          test -f ../out-patched/dxvk-patched/x64/dxgi.dll
+          test -f ../out-patched/dxvk-patched/x64/d3d11.dll
+
+      - name: Audit exact A-B scope and stage artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifact/control artifact/patched
+
+          cp out-control/dxvk-control/x64/dxgi.dll artifact/control/
+          cp out-control/dxvk-control/x64/d3d11.dll artifact/control/
+          cp out-patched/dxvk-patched/x64/dxgi.dll artifact/patched/
+          cp out-patched/dxvk-patched/x64/d3d11.dll artifact/patched/
+
+          echo "CONTROL_DXGI_SHA256=$(sha256sum artifact/control/dxgi.dll | awk '{print $1}')"
+          echo "CONTROL_D3D11_SHA256=$(sha256sum artifact/control/d3d11.dll | awk '{print $1}')"
+          echo "PATCHED_DXGI_SHA256=$(sha256sum artifact/patched/dxgi.dll | awk '{print $1}')"
+          echo "PATCHED_D3D11_SHA256=$(sha256sum artifact/patched/d3d11.dll | awk '{print $1}')"
+
+          cmp -s artifact/control/d3d11.dll artifact/patched/d3d11.dll
+          test "$(sha256sum artifact/control/d3d11.dll | awk '{print $1}')" = "$(sha256sum artifact/patched/d3d11.dll | awk '{print $1}')"
+
+          git -C dxvk-patched diff --exit-code -- src/util
+          git -C dxvk-patched diff --exit-code -- src/d3d11
+          git -C dxvk-patched diff --exit-code -- src/dxvk
+          git -C dxvk-patched diff --exit-code -- src/wsi
+
+          cat > artifact/identity.txt <<EOF
+          DXVK_COMMIT=$DXVK_COMMIT
+          PATCH=src/dxgi/dxgi_output.cpp only
+          OLD=Sleep::sleepUntil(t1, t2);
+          NEW=std::this_thread::sleep_until(t2);
+          CONTROL_INSTALLED_DXGI_SHA256=49cd72ff238d217da9f308a21b58530f3bbd080c9d2034317d21800c19074fdd
+          CONTROL_INSTALLED_D3D11_SHA256=0ec7afc6fd0b6a9c3896eb8cde6c4d5b384b1fb0ddf826d21455e9dbeb6defee
+          EOF
+
+      - name: Upload CONTROL and PATCHED DXVK artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FiveM-perf-dxvk-vblank-stdsleep
+          path: artifact
+          if-no-files-found: error
+
+      - name: Report artifact identity
+        shell: bash
+        run: |
+          echo "ARTIFACT_ID=${{ steps.upload.outputs.artifact-id }}"
+          echo "ARTIFACT_ZIP_SHA256=${{ steps.upload.outputs.artifact-digest }}"
