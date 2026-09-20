@@ -9,6 +9,7 @@
 #include "NUIApp.h"
 #include "CefOverlay.h"
 #include <CoreConsole.h>
+#include <LaunchMode.h>
 #include "memdbgon.h"
 #include <CrossBuildRuntime.h>
 #include <PureModeState.h>
@@ -203,6 +204,13 @@ void NUIApp::OnBeforeCommandLineProcessing(const CefString& process_type, CefRef
 	command_line->AppendSwitch("enable-gpu-rasterization");
 #else
 	command_line->AppendSwitch("disable-gpu-vsync");
+#endif
+
+#if defined(GTA_FIVE)
+	if (CfxIsWine())
+	{
+		command_line->AppendSwitch("disable-gpu-vsync");
+	}
 #endif
 
 	command_line->AppendSwitch("disable-gpu-process-crash-limit");
