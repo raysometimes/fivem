@@ -88,8 +88,8 @@ jobs:
           }
 
           $allowedFiles = @(
-            '.github/workflows/fivem-official-wine-nui-shared-release.yml',
-            'code/components/nui-core/src/NUIWindow.cpp'
+            '.github/workflows/fivem-perf-cef-disable-gpu-vsync.yml',
+            'code/components/nui-core/src/NUIApp.cpp'
           )
           $changedFiles = @(git diff --name-only $env:EXPERIMENT_BASE_COMMIT $env:GITHUB_SHA)
           if ($LASTEXITCODE -ne 0) {
@@ -117,16 +117,25 @@ jobs:
             throw "Unable to print the experiment diff."
           }
 
-          $nuiPath = Join-Path $env:SOURCE_ROOT 'code\components\nui-core\src\NUIWindow.cpp'
-          $nuiSource = Get-Content $nuiPath -Raw
-          $enabledAssignment = 'info.shared_texture_enabled = nuiSharedResourcesEnabled;'
-          $guardedAssignment = 'info.shared_texture_enabled = (!CfxIsWine() && nuiSharedResourcesEnabled);'
-
-          if ([regex]::Matches($nuiSource, [regex]::Escape($enabledAssignment)).Count -ne 1) {
-            throw "The enabled shared-texture assignment is missing or duplicated."
+          $nuiAppPath = Join-Path $env:SOURCE_ROOT 'code\components\nui-core\src\NUIApp.cpp'
+          $nuiAppSource = Get-Content $nuiAppPath -Raw
+          if (-not $nuiAppSource.Contains('#include <LaunchMode.h>')) {
+            throw "LaunchMode include required for CfxIsWine is missing."
           }
-          if ($nuiSource.Contains($guardedAssignment)) {
-            throw "The Wine-disabled shared-texture assignment is still present."
+          if ([regex]::Matches($nuiAppSource, [regex]::Escape('if (CfxIsWine())')).Count -ne 1) {
+            throw "Expected exactly one CfxIsWine conditional in NUIApp.cpp."
+          }
+          if ([regex]::Matches($nuiAppSource, [regex]::Escape('command_line->AppendSwitch("disable-gpu-vsync");')).Count -ne 2) {
+            throw "Expected exactly two disable-gpu-vsync sites: existing GTA_NY and Wine GTA_FIVE test."
+          }
+
+          $nuiWindowPath = Join-Path $env:SOURCE_ROOT 'code\components\nui-core\src\NUIWindow.cpp'
+          $nuiWindowSource = Get-Content $nuiWindowPath -Raw
+          if (-not $nuiWindowSource.Contains('info.shared_texture_enabled = nuiSharedResourcesEnabled;')) {
+            throw "Proven shared-texture compatibility assignment is missing."
+          }
+          if (-not $nuiWindowSource.Contains('settings.windowless_frame_rate = 240;')) {
+            throw "CEF windowless frame rate changed; this experiment must keep 240."
           }
 
           $corePath = Join-Path $env:SOURCE_ROOT 'code\client\citicore\SEHTableHandler.Win32.cpp'
@@ -188,7 +197,7 @@ jobs:
           [xml]$rootProjectXml = Get-Content $rootProject -Raw
           $projectDirectory = Split-Path $rootProject -Parent
           $expectedSource = [System.IO.Path]::GetFullPath(
-            (Join-Path $env:SOURCE_ROOT 'code\components\nui-core\src\NUIWindow.cpp')
+            (Join-Path $env:SOURCE_ROOT 'code\components\nui-core\src\NUIApp.cpp')
           )
           $compiledSources = @(
             $rootProjectXml.SelectNodes("//*[local-name()='ClCompile']") |
