@@ -782,6 +782,14 @@ static InitFunction initFunction([]()
 					hash[10], hash[11], hash[12], hash[13], hash[14], hash[15], hash[16], hash[17], hash[18], hash[19]));
 			}
 
+			if (lanVar->GetValue() && client->GetTcpEndPoint() == "127.0.0.1" && !client->GetData("entitlementHash"))
+			{
+				// Fixed project-local synthetic value; never derived from client or user data.
+				static constexpr char kLocalLoopbackEntitlementHash[] = "3910153960ead84026664a9fb1fca8822e01fc18";
+				client->SetData("entitlementHash", std::string{ kLocalLoopbackEntitlementHash });
+				console::Printf("server", "[LocalLoopbackLicense] injected deterministic localhost entitlement\n");
+			}
+
 			bool gameNameMatch = false;
 
 			if (ticketData.extraJson)
