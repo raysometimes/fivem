@@ -1,0 +1,361 @@
+name: FXServer 25770 Self-Built Control
+
+on:
+  push:
+    branches:
+      - diagnostics/fxserver-25770-selfbuilt-control
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fxserver-25770-selfbuilt-control-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux-server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    env:
+      BASE_COMMIT: 8ddccd4e4dfd6a760ce18651656463f961cc4761
+      BASE_TREE: b5ebdba2e4074b707a508288975fc28d2870a934
+      SOURCE_FILE: code/components/citizen-server-impl/src/InitConnectMethod.cpp
+      WORKFLOW_FILE: .github/workflows/fxserver-25770-selfbuilt-control.yml
+      LICENSE_PROVIDER_FILE: code/components/citizen-server-impl/src/LicenseIdentityProvider.cpp
+      BASE_SOURCE_BLOB: a2e29a37782524b4770ef4a242a30d4e73a8582d
+      BASE_LICENSE_PROVIDER_BLOB: 59f070a8b9364cb6c98d2d486bc7dd438ec005c2
+      PATCHED_REFERENCE_COMMIT: 595df7b1c2f40e352c35392256a8b11fe2a5c69b
+      BUILDER_IMAGE_REPOSITORY: raysometimes/fivem
+      ARTIFACT_BASENAME: FXServer-25770-selfbuilt-control
+      LEGACY_CFX_MIRROR_PREFIX: https://mirrors.fivem.net/build/linux
+      CURRENT_CFX_MIRROR_PREFIX: https://content.cfx.re/mirrors/build/linux
+      BUILDER_GIT_VERSION: 2.36.6-r0
+      BUILDER_CXX_FORCE_INCLUDE: stdint.h
+
+    steps:
+      - name: Checkout exact experiment commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          submodules: false
+
+      - name: Audit base, branch, tree and empty code delta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          head_commit="$(git rev-parse HEAD)"
+          parent_commit="$(git rev-parse HEAD^)"
+          head_tree="$(git rev-parse HEAD^{tree})"
+          base_tree="$(git rev-parse "$BASE_COMMIT^{tree}")"
+          base_source_blob="$(git rev-parse "$BASE_COMMIT:$SOURCE_FILE")"
+          head_source_blob="$(git rev-parse "HEAD:$SOURCE_FILE")"
+          base_provider_blob="$(git rev-parse "$BASE_COMMIT:$LICENSE_PROVIDER_FILE")"
+          head_provider_blob="$(git rev-parse "HEAD:$LICENSE_PROVIDER_FILE")"
+
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "HEAD commit: $head_commit"
+          echo "Parent commit: $parent_commit"
+          echo "HEAD tree: $head_tree"
+          echo "Base commit: $BASE_COMMIT"
+          echo "Base tree: $base_tree"
+          echo "Base source blob: $base_source_blob"
+          echo "HEAD source blob: $head_source_blob"
+          echo "Base LicenseIdentityProvider blob: $base_provider_blob"
+          echo "HEAD LicenseIdentityProvider blob: $head_provider_blob"
+          echo "Patched build reference: $PATCHED_REFERENCE_COMMIT"
+          echo "Isolated builder mirror substitution: $LEGACY_CFX_MIRROR_PREFIX -> $CURRENT_CFX_MIRROR_PREFIX"
+          echo "Isolated builder Git pin: $BUILDER_GIT_VERSION"
+          echo "Isolated builder C++ force-include: $BUILDER_CXX_FORCE_INCLUDE"
+
+          test "$GITHUB_REF_NAME" = "diagnostics/fxserver-25770-selfbuilt-control"
+          test "$head_commit" = "$GITHUB_SHA"
+          test "$parent_commit" = "$BASE_COMMIT"
+          test "$base_tree" = "$BASE_TREE"
+          test "$base_source_blob" = "$BASE_SOURCE_BLOB"
+          test "$head_source_blob" = "$BASE_SOURCE_BLOB"
+          test "$base_provider_blob" = "$BASE_LICENSE_PROVIDER_BLOB"
+          test "$head_provider_blob" = "$BASE_LICENSE_PROVIDER_BLOB"
+
+          mapfile -t changed_files < <(git diff --name-only "$BASE_COMMIT" HEAD)
+          printf 'Files changed from base:\n'
+          printf '  %s\n' "${changed_files[@]}"
+
+          if [[ ${#changed_files[@]} -ne 1 ]] || [[ "${changed_files[0]}" != "$WORKFLOW_FILE" ]]; then
+            echo "Unexpected base delta; only the dedicated control workflow is allowed." >&2
+            exit 1
+          fi
+
+          mapfile -t code_files < <(git diff --name-only "$BASE_COMMIT" HEAD -- code)
+          if [[ ${#code_files[@]} -ne 0 ]]; then
+            echo 'Control violation: code/ must be byte-identical to the base.' >&2
+            printf '  %s\n' "${code_files[@]}" >&2
+            exit 1
+          fi
+
+          test -z "$(git diff --name-only "$BASE_COMMIT" HEAD -- code)"
+          echo 'Code diff from base: empty (strict self-built control)'
+          echo 'Control diff stat:'
+          git --no-pager diff --stat "$BASE_COMMIT" HEAD
+
+      - name: Prepare isolated builder context with the current official CFX mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          builder_context="$RUNNER_TEMP/fxserver-25770-builder-context"
+          builder_path="$builder_context/code/tools/ci/docker-builder"
+          builder_dockerfile="$builder_path/Dockerfile"
+          builder_script="$builder_path/proot_prepare.sh"
+          cfx_index="$CURRENT_CFX_MIRROR_PREFIX/packages/cfx/x86_64/APKINDEX.tar.gz"
+
+          mkdir -p "$builder_path"
+          cp code/tools/ci/docker-builder/Dockerfile "$builder_path/Dockerfile"
+          cp code/tools/ci/docker-builder/proot_prepare.sh "$builder_script"
+
+          # Keep the pinned builder recipe byte-for-byte apart from the two
+          # obsolete mirror hosts, the exact Alpine 3.16 Git pin needed by the
+          # recipe's pinned curl/libcurl 7.72.0-r99 ABI, and a builder-only
+          # clang++ wrapper for the legacy CPR header's intptr_t dependency.
+          test "$(grep -Foc "$LEGACY_CFX_MIRROR_PREFIX" "$builder_script")" -eq 2
+          sed -i "s|$LEGACY_CFX_MIRROR_PREFIX|$CURRENT_CFX_MIRROR_PREFIX|g" "$builder_script"
+          test "$(grep -Foc "$CURRENT_CFX_MIRROR_PREFIX" "$builder_script")" -eq 2
+          if grep -Fq "$LEGACY_CFX_MIRROR_PREFIX" "$builder_script"; then
+            echo 'Legacy CFX mirror reference remained in the isolated builder context.' >&2
+            exit 1
+          fi
+
+          test "$(grep -Foc ' git dotnet6-sdk' "$builder_script")" -eq 1
+          sed -i "s| git dotnet6-sdk| git=$BUILDER_GIT_VERSION dotnet6-sdk|" "$builder_script"
+          test "$(grep -Foc "git=$BUILDER_GIT_VERSION" "$builder_script")" -eq 1
+          if grep -Fq ' git dotnet6-sdk' "$builder_script"; then
+            echo 'Unpinned Git package remained in the isolated builder context.' >&2
+            exit 1
+          fi
+
+          printf '%s\n' \
+            '' \
+            '# Supply the standard intptr_t definition expected by the pinned legacy CPR headers.' \
+            'RUN printf '\''%s\n'\'' '\''#!/bin/sh'\'' '\''exec /usr/bin/clang++ -include stdint.h "$@"'\'' > /app/alpine/usr/local/bin/clang++ \' \
+            '    && chmod 0755 /app/alpine/usr/local/bin/clang++' \
+            >> "$builder_dockerfile"
+
+          echo "Builder context: $builder_context"
+          echo "CFX package index: $cfx_index"
+          echo 'Pinned source builder files:'
+          sha256sum \
+            code/tools/ci/docker-builder/Dockerfile \
+            code/tools/ci/docker-builder/proot_prepare.sh
+          echo 'Isolated builder files:'
+          sha256sum "$builder_path/Dockerfile" "$builder_script"
+          echo 'Exact isolated builder recipe delta:'
+          diff -u code/tools/ci/docker-builder/proot_prepare.sh "$builder_script" || test "$?" -eq 1
+          diff -u code/tools/ci/docker-builder/Dockerfile "$builder_dockerfile" || test "$?" -eq 1
+
+          curl --fail --silent --show-error --head \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 10 \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "$cfx_index" >/dev/null
+
+      - name: Log in to the container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish the fork-local upstream builder image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/fxserver-25770-builder-context
+          file: ${{ runner.temp }}/fxserver-25770-builder-context/code/tools/ci/docker-builder/Dockerfile
+          push: true
+          tags: ghcr.io/${{ env.BUILDER_IMAGE_REPOSITORY }}/fivem-builder-linux-alpine:latest
+
+      - name: Smoke-test pinned Git HTTPS inside the builder image
+        shell: bash
+        run: |
+          set -euo pipefail
+          builder_image="ghcr.io/$BUILDER_IMAGE_REPOSITORY/fivem-builder-linux-alpine:latest"
+          docker run --rm "$builder_image" /usr/local/bin/proot \
+            --kill-on-exit \
+            -b /dev:/dev \
+            -b /sys:/sys \
+            -b /proc:/proc \
+            -b /tmp:/tmp \
+            -b /root:/root \
+            -R /app/alpine /bin/sh -xec '
+              apk policy git libcurl curl
+              git --version
+              git ls-remote https://github.com/citizenfx/node-libclang.git HEAD
+              test "$(command -v clang++)" = /usr/local/bin/clang++
+              grep -Fx '\''exec /usr/bin/clang++ -include stdint.h "$@"'\'' /usr/local/bin/clang++
+              printf '\''%s\n'\'' '\''int main() { intptr_t value = 0; return static_cast<int>(value); }'\'' |
+                clang++ -x c++ -c -o /tmp/force-include-smoke.o -
+            '
+
+      - name: Initialize pinned submodules using the normal CI route
+        shell: bash
+        run: |
+          set -euo pipefail
+          JOB_SLOTS="$(nproc --all)"
+          echo "Submodule jobs: $JOB_SLOTS"
+          git submodule sync --recursive
+          git submodule update --jobs="$JOB_SLOTS" --init --depth=1
+
+      - name: Build Linux Server through the upstream public Alpine route
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Build entrypoint: .github/workflows/ci/build_linux.sh'
+          echo 'Container build script: code/tools/ci/build_server_docker_alpine_public.sh'
+          echo "Builder image repository: $BUILDER_IMAGE_REPOSITORY"
+          chmod +x .github/workflows/ci/build_linux.sh
+          GITHUB_REPOSITORY="$BUILDER_IMAGE_REPOSITORY" .github/workflows/ci/build_linux.sh
+
+      - name: Restore runner ownership after the upstream container build
+        shell: bash
+        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
+      - name: Package and hash exact server outputs
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          server_root="$GITHUB_WORKSPACE/alpine/opt/cfx-server"
+          artifact_root="$GITHUB_WORKSPACE/artifact"
+          package_name="$ARTIFACT_BASENAME-$GITHUB_SHA.tar.xz"
+          package_path="$artifact_root/$package_name"
+          component_name="libcitizen-server-impl.so"
+          component_path="$server_root/$component_name"
+
+          test -x "$server_root/FXServer"
+          test -f "$component_path"
+          mkdir -p "$artifact_root"
+
+          LC_ALL=C find "$server_root" -type f -printf '%P\0' |
+            LC_ALL=C sort -z |
+            while IFS= read -r -d '' file; do
+              sha256sum "$server_root/$file"
+            done |
+            sed "s|  $server_root/|  |" > "$artifact_root/server-tree-SHA256SUMS.txt"
+
+          commit_time="$(git show -s --format=%ct HEAD)"
+          tar --sort=name \
+            --mtime="@$commit_time" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "$GITHUB_WORKSPACE/alpine/opt" \
+            -cJf "$package_path" cfx-server
+
+          cp "$server_root/FXServer" "$artifact_root/FXServer"
+          git --no-pager diff --no-ext-diff "$BASE_COMMIT" HEAD -- code > "$artifact_root/functional.diff"
+          test ! -s "$artifact_root/functional.diff"
+
+          component_sha256="$(sha256sum "$component_path" | awk '{print $1}')"
+          component_build_id="$(readelf -n "$component_path" | sed -n 's/.*Build ID: //p' | head -n 1)"
+          test -n "$component_build_id"
+          printf '%s  %s\n' "$component_sha256" "$component_name" > "$artifact_root/libcitizen-server-impl-SHA256.txt"
+          printf '%s\n' "$component_build_id" > "$artifact_root/libcitizen-server-impl-BuildID.txt"
+          readelf -d "$component_path" |
+            grep -E '\(NEEDED\)|\(SONAME\)' > "$artifact_root/libcitizen-server-impl-readelf-dynamic.txt"
+          test "$(grep -c '(SONAME)' "$artifact_root/libcitizen-server-impl-readelf-dynamic.txt")" -eq 1
+          test "$(grep -c '(NEEDED)' "$artifact_root/libcitizen-server-impl-readelf-dynamic.txt")" -gt 0
+
+          {
+            echo "branch=$GITHUB_REF_NAME"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "parent=$(git rev-parse HEAD^)"
+            echo "tree=$(git rev-parse HEAD^{tree})"
+            echo "base_commit=$BASE_COMMIT"
+            echo "base_tree=$BASE_TREE"
+            echo "code_diff=empty"
+            echo "patched_reference_commit=$PATCHED_REFERENCE_COMMIT"
+            echo "build_entrypoint=.github/workflows/ci/build_linux.sh"
+            echo "container_build_script=code/tools/ci/build_server_docker_alpine_public.sh"
+            echo "builder_mirror_substitution=$LEGACY_CFX_MIRROR_PREFIX -> $CURRENT_CFX_MIRROR_PREFIX"
+            echo "builder_git_version=$BUILDER_GIT_VERSION"
+            echo "builder_cxx_force_include=$BUILDER_CXX_FORCE_INCLUDE"
+            echo "server_root=alpine/opt/cfx-server"
+          } > "$artifact_root/build-identity.txt"
+
+          (
+            cd "$artifact_root"
+            sha256sum \
+              FXServer \
+              "$package_name" \
+              server-tree-SHA256SUMS.txt \
+              functional.diff \
+              build-identity.txt \
+              libcitizen-server-impl-SHA256.txt \
+              libcitizen-server-impl-BuildID.txt \
+              libcitizen-server-impl-readelf-dynamic.txt > SHA256SUMS.txt
+          )
+
+          echo "artifact_name=$ARTIFACT_BASENAME-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+
+          echo 'Exact artifact files and SHA256:'
+          cat "$artifact_root/SHA256SUMS.txt"
+          echo "Server output file count: $(find "$server_root" -type f | wc -l)"
+          echo "Server tree manifest SHA256: $(sha256sum "$artifact_root/server-tree-SHA256SUMS.txt" | awk '{print $1}')"
+          echo "libcitizen-server-impl.so SHA256: $component_sha256"
+          echo "libcitizen-server-impl.so BuildID: $component_build_id"
+          echo 'libcitizen-server-impl.so readelf -d NEEDED/SONAME:'
+          cat "$artifact_root/libcitizen-server-impl-readelf-dynamic.txt"
+          echo "Server package: $package_path"
+
+      - name: Upload isolated FXServer artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Report artifact identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Artifact name: ${{ steps.package.outputs.artifact_name }}"
+          echo "Artifact ID: ${{ steps.upload.outputs.artifact-id }}"
+          echo "Artifact digest/ZIP SHA256: ${{ steps.upload.outputs.artifact-digest }}"
+          echo "Artifact URL: ${{ steps.upload.outputs.artifact-url }}"
+          {
+            echo '## FXServer 25770 strict self-built control'
+            echo
+            echo "- Branch: \`$GITHUB_REF_NAME\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Parent: \`$(git rev-parse HEAD^)\`"
+            echo "- Tree: \`$(git rev-parse HEAD^{tree})\`"
+            echo '- Code diff from base: `empty`'
+            echo "- Patched reference: \`$PATCHED_REFERENCE_COMMIT\`"
+            echo "- Builder mirror: \`$CURRENT_CFX_MIRROR_PREFIX\`"
+            echo "- Builder Git: \`$BUILDER_GIT_VERSION\`"
+            echo "- Builder C++ force-include: \`$BUILDER_CXX_FORCE_INCLUDE\`"
+            echo "- Artifact: \`${{ steps.package.outputs.artifact_name }}\`"
+            echo "- Artifact ID: \`${{ steps.upload.outputs.artifact-id }}\`"
+            echo "- Artifact digest/ZIP SHA256: \`${{ steps.upload.outputs.artifact-digest }}\`"
+            echo
+            echo '### Exact artifact files and SHA256'
+            echo '```text'
+            cat artifact/SHA256SUMS.txt
+            echo '```'
+            echo
+            echo '### libcitizen-server-impl.so'
+            echo '```text'
+            cat artifact/libcitizen-server-impl-SHA256.txt
+            echo "Build ID: $(cat artifact/libcitizen-server-impl-BuildID.txt)"
+            cat artifact/libcitizen-server-impl-readelf-dynamic.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
